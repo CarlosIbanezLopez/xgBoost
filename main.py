@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import os
 from typing import Literal, Optional
 
 import numpy as np
-from fastapi import FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException, status
+from fastapi.security import APIKeyHeader
 from pydantic import BaseModel, Field
 
 from config import (
@@ -60,6 +62,7 @@ class PredictRequest(BaseModel):
 class RegressionPrediction(BaseModel):
     predicted_price: float
     expected_abs_error: float
+    expected_pct_error: float
     interval_approx: dict
 
 
@@ -68,7 +71,25 @@ class ClassificationPrediction(BaseModel):
     probabilities: dict
 
 
-@app.post("/train", response_model=TrainResponse)
+# --- Seguridad básica para /train ---
+API_KEY_TRAIN = os.getenv("API_KEY_TRAIN")
+api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
+
+
+async def require_train_key(api_key: str = Depends(api_key_header)):
+    if not API_KEY_TRAIN:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Train API not configured",
+        )
+    if api_key != API_KEY_TRAIN:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid API key",
+        )
+
+
+@app.post("/train", response_model=TrainResponse, dependencies=[Depends(require_train_key)])
 def train_endpoint():
     """
     Entrena ambos modelos (regresión y clasificación) leyendo datos desde Postgres.
@@ -78,16 +99,22 @@ def train_endpoint():
     return TrainResponse(reg_mae=models.reg_mae)
 
 
+_regression_bundle = None
+_classification_bundle = None
+
+
 def _load_bundles_or_500():
+    global _regression_bundle, _classification_bundle
     try:
-        reg_bundle = load_regression_bundle()
-        clf_bundle = load_classification_bundle()
+        if _regression_bundle is None or _classification_bundle is None:
+            _regression_bundle = load_regression_bundle()
+            _classification_bundle = load_classification_bundle()
     except FileNotFoundError:
         raise HTTPException(
             status_code=500,
             detail="Modelos no encontrados. Ejecuta primero POST /train o corre ml_pipeline.py.",
         )
-    return reg_bundle, clf_bundle
+    return _regression_bundle, _classification_bundle
 
 
 def _prepare_feature_row(payload: PredictRequest, encoder, numeric_features, categorical_features):
@@ -109,20 +136,33 @@ def predict_regression(payload: PredictRequest):
     numeric_features = reg_bundle.get("numeric_features", NUMERIC_FEATURES)
     categorical_features = reg_bundle.get("categorical_features", CATEGORICAL_FEATURES)
     reg_mae = float(reg_bundle.get("reg_mae", 0.0))
+    price_bins = np.array(reg_bundle.get("price_bins"))
+    mean_abs_pct_error_by_bin = np.array(reg_bundle.get("mean_abs_pct_error_by_bin"))
 
     X_row = _prepare_feature_row(payload, encoder, numeric_features, categorical_features)
     pred = float(regressor.predict(X_row)[0])
 
-    # Intervalo aproximado basándonos en el MAE global
-    if reg_mae > 0:
-        lower = max(pred - reg_mae, 0.0)
-        upper = pred + reg_mae
+    # Error absoluto esperado global (para compatibilidad)
+    expected_abs_error = reg_mae
+
+    # Error porcentual esperado según el rango de precio predicho
+    if price_bins is not None and mean_abs_pct_error_by_bin is not None:
+        # encontrar el bin para este precio predicho
+        bin_idx = int(np.digitize(pred, price_bins, right=True) - 1)
+        bin_idx = max(0, min(bin_idx, len(mean_abs_pct_error_by_bin) - 1))
+        expected_pct_error = float(mean_abs_pct_error_by_bin[bin_idx])
     else:
-        lower = upper = pred
+        # fallback: usar MAE global sobre el propio precio
+        expected_pct_error = float(expected_abs_error / pred) if pred != 0 else 0.0
+
+    # Intervalo aproximado basado en el error porcentual
+    lower = max(pred * (1.0 - expected_pct_error), 0.0)
+    upper = pred * (1.0 + expected_pct_error)
 
     return RegressionPrediction(
         predicted_price=pred,
-        expected_abs_error=reg_mae,
+        expected_abs_error=expected_abs_error,
+        expected_pct_error=expected_pct_error,
         interval_approx={"lower": lower, "upper": upper},
     )
 

@@ -6,13 +6,14 @@ from typing import List, Tuple
 import joblib
 import numpy as np
 import pandas as pd
-from sklearn.metrics import mean_absolute_error
+from sklearn.metrics import accuracy_score, f1_score, mean_absolute_error
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import OrdinalEncoder
 from xgboost import XGBClassifier, XGBRegressor
 
 from config import (
     CLASSIFIER_PATH,
+    ENCODER_PATH,
     RANDOM_STATE,
     REGRESSOR_PATH,
 )
@@ -56,6 +57,11 @@ class TrainedModels:
     classifier: XGBClassifier
     encoder: OrdinalEncoder
     reg_mae: float
+    clf_accuracy: float
+    clf_f1_weighted: float
+    # métricas de error relativo por rango de precio
+    price_bins: np.ndarray
+    mean_abs_pct_error_by_bin: np.ndarray
 
 
 def _build_features(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.Series, pd.Series]:
@@ -117,9 +123,10 @@ def train_models(test_size: float = 0.2) -> TrainedModels:
 
     X_full = np.hstack([X_num.values, X_cat_enc])
 
-    X_train, X_test, y_train, y_test = train_test_split(
+    X_train, X_test, y_reg_train, y_reg_test, y_clf_train, y_clf_test = train_test_split(
         X_full,
         y_reg,
+        y_clf,
         test_size=test_size,
         random_state=RANDOM_STATE,
     )
@@ -134,12 +141,37 @@ def train_models(test_size: float = 0.2) -> TrainedModels:
         random_state=RANDOM_STATE,
         n_jobs=-1,
     )
-    regressor.fit(X_train, y_train)
+    regressor.fit(X_train, y_reg_train)
 
-    y_pred = regressor.predict(X_test)
-    reg_mae = float(mean_absolute_error(y_test, y_pred))
+    y_reg_pred = regressor.predict(X_test)
+    reg_mae = float(mean_absolute_error(y_reg_test, y_reg_pred))
 
-    # Clasificador usando las mismas features
+    # Error porcentual absoluto por muestra en test
+    denom = np.clip(np.abs(y_reg_test.values), 1e-6, None)
+    abs_pct_error = np.abs(y_reg_test.values - y_reg_pred) / denom
+
+    # Bins de precio según el valor predicho
+    # Usamos cuantiles para adaptarnos a la distribución de precios
+    price_bins = np.quantile(y_reg_pred, [0.0, 0.25, 0.5, 0.75, 1.0])
+    # Asegurar que los bins sean estrictamente crecientes para evitar problemas numéricos
+    price_bins = np.unique(price_bins)
+    if price_bins.shape[0] < 2:
+        # fallback: un solo bin que cubre todo
+        price_bins = np.array([y_reg_pred.min(), y_reg_pred.max()])
+
+    bin_indices = np.digitize(y_reg_pred, price_bins, right=True) - 1
+    bin_indices = np.clip(bin_indices, 0, price_bins.shape[0] - 2)
+
+    mean_abs_pct_error_by_bin = []
+    for b in range(price_bins.shape[0] - 1):
+        mask = bin_indices == b
+        if not np.any(mask):
+            mean_abs_pct_error_by_bin.append(float(abs_pct_error.mean()))
+        else:
+            mean_abs_pct_error_by_bin.append(float(abs_pct_error[mask].mean()))
+    mean_abs_pct_error_by_bin = np.array(mean_abs_pct_error_by_bin)
+
+    # Clasificador usando las mismas features (sin data leakage)
     classifier = XGBClassifier(
         n_estimators=300,
         learning_rate=0.05,
@@ -151,13 +183,21 @@ def train_models(test_size: float = 0.2) -> TrainedModels:
         random_state=RANDOM_STATE,
         n_jobs=-1,
     )
-    classifier.fit(X_full, y_clf)
+    classifier.fit(X_train, y_clf_train)
+
+    y_clf_pred = classifier.predict(X_test)
+    clf_accuracy = float(accuracy_score(y_clf_test, y_clf_pred))
+    clf_f1_weighted = float(f1_score(y_clf_test, y_clf_pred, average="weighted"))
 
     return TrainedModels(
         regressor=regressor,
         classifier=classifier,
         encoder=encoder,
         reg_mae=reg_mae,
+        clf_accuracy=clf_accuracy,
+        clf_f1_weighted=clf_f1_weighted,
+        price_bins=price_bins,
+        mean_abs_pct_error_by_bin=mean_abs_pct_error_by_bin,
     )
 
 
@@ -165,41 +205,65 @@ def save_models(models: TrainedModels) -> None:
     """
     Persiste modelos y encoder a disco.
     """
+    # Guardar encoder una sola vez
     joblib.dump(
         {
-            "regressor": models.regressor,
-            "classifier": models.classifier,
             "encoder": models.encoder,
             "numeric_features": NUMERIC_FEATURES,
             "categorical_features": CATEGORICAL_FEATURES,
+        },
+        ENCODER_PATH,
+    )
+
+    # Bundle de regresión
+    joblib.dump(
+        {
+            "regressor": models.regressor,
+            "numeric_features": NUMERIC_FEATURES,
+            "categorical_features": CATEGORICAL_FEATURES,
             "reg_mae": models.reg_mae,
+            "clf_accuracy": models.clf_accuracy,
+            "clf_f1_weighted": models.clf_f1_weighted,
+            "price_bins": models.price_bins,
+            "mean_abs_pct_error_by_bin": models.mean_abs_pct_error_by_bin,
         },
         REGRESSOR_PATH,
     )
 
-    # Guardamos también solo el clasificador para cargar más rápido si se quiere
+    # Bundle de clasificación
     joblib.dump(
         {
             "classifier": models.classifier,
-            "encoder": models.encoder,
             "numeric_features": NUMERIC_FEATURES,
             "categorical_features": CATEGORICAL_FEATURES,
             "reg_mae": models.reg_mae,
+            "clf_accuracy": models.clf_accuracy,
+            "clf_f1_weighted": models.clf_f1_weighted,
         },
         CLASSIFIER_PATH,
     )
 
 
 def load_regression_bundle():
-    return joblib.load(REGRESSOR_PATH)
+    bundle = joblib.load(REGRESSOR_PATH)
+    encoder_bundle = joblib.load(ENCODER_PATH)
+    bundle["encoder"] = encoder_bundle["encoder"]
+    return bundle
 
 
 def load_classification_bundle():
-    return joblib.load(CLASSIFIER_PATH)
+    bundle = joblib.load(CLASSIFIER_PATH)
+    encoder_bundle = joblib.load(ENCODER_PATH)
+    bundle["encoder"] = encoder_bundle["encoder"]
+    return bundle
 
 
 if __name__ == "__main__":
     models = train_models()
     save_models(models)
     print(f"Entrenamiento completado. MAE regresión: {models.reg_mae:.2f}")
+    print(
+        f"Métricas clasificador - accuracy: {models.clf_accuracy:.3f}, "
+        f"F1 (weighted): {models.clf_f1_weighted:.3f}"
+    )
 
