@@ -8,6 +8,7 @@ from fastapi import Depends, FastAPI, HTTPException, status
 from fastapi.security import APIKeyHeader
 from pydantic import BaseModel, Field
 
+from db import fetch_comparable_listings
 from config import (
     CLASSIFIER_PATH,
     REGRESSOR_PATH,
@@ -65,6 +66,7 @@ class RegressionPrediction(BaseModel):
     expected_abs_error: float
     expected_pct_error: float
     interval_approx: dict
+    comparables: list[dict] = Field(default_factory=list)
 
 
 class ClassificationPrediction(BaseModel):
@@ -169,11 +171,23 @@ def predict_regression(payload: PredictRequest):
     lower = max(pred * (1.0 - expected_pct_error), 0.0)
     upper = pred * (1.0 + expected_pct_error)
 
+    comparables = fetch_comparable_listings(
+        latitude=payload.latitude,
+        longitude=payload.longitude,
+        ciudad=payload.ciudad,
+        pais=payload.pais,
+        tipo_propiedad=payload.tipo_propiedad,
+        m2_construidos=payload.m2_construidos,
+        m2_terreno=payload.m2_terreno,
+        limit=20,
+    )
+
     return RegressionPrediction(
         predicted_price=pred,
         expected_abs_error=expected_abs_error,
         expected_pct_error=expected_pct_error,
         interval_approx={"lower": lower, "upper": upper},
+        comparables=comparables,
     )
 
 
