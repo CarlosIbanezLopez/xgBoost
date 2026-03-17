@@ -41,7 +41,7 @@ class PredictRequest(BaseModel):
     estacionamientos: int = 0
     antiguedad: int = 0
     precio_publicacion: float = 0
-    precio_m2: float = 0
+    precio_m2: Optional[float] = None
     tiempo_en_mercado: int = 0
     numero_reducciones: int = 0
     diferencia_vs_promedio_zona: float = 0
@@ -55,6 +55,7 @@ class PredictRequest(BaseModel):
     categoria_propiedad: Optional[str] = "Casa"
     estado_propiedad: Optional[str] = "Sin especificar"
     ciudad: Optional[str] = "Santa Cruz de la Sierra"
+    pais: Optional[str] = "Bolivia"
     status: Optional[str] = "Activa"
     transaction_type: Optional[str] = "Venta"
 
@@ -119,6 +120,15 @@ def _load_bundles_or_500():
 
 def _prepare_feature_row(payload: PredictRequest, encoder, numeric_features, categorical_features):
     data = payload.dict()
+
+    # Calcular precio_m2 si no viene o viene en 0
+    if data.get("precio_m2") in (None, 0):
+        area = data.get("m2_construidos") or data.get("m2_terreno") or 0
+        if area and area > 0:
+            data["precio_m2"] = float(data["precio_publicacion"]) / float(area)
+        else:
+            data["precio_m2"] = 0.0
+
     X_num = np.array([[float(data.get(col, 0)) for col in numeric_features]])
     X_cat_raw = [[str(data.get(col, "Desconocido")) for col in categorical_features]]
     X_cat = encoder.transform(X_cat_raw)

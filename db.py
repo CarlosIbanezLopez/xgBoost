@@ -61,6 +61,7 @@ def fetch_property_analytics(limit: int | None = None) -> pd.DataFrame:
             longitude,
             cluster_zona,
             ciudad,
+            pais,
             m2_construidos,
             m2_terreno,
             dormitorios,

@@ -46,6 +46,7 @@ CATEGORICAL_FEATURES: List[str] = [
     "categoria_propiedad",
     "estado_propiedad",
     "ciudad",
+    "pais",
     "status",
     "transaction_type",
 ]
@@ -82,6 +83,15 @@ def _build_features(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.Series, pd.Serie
             df[col] = df[col].fillna(0)
         else:
             df[col] = 0
+
+    # Si precio_m2 no viene o es 0, lo calculamos como precio_publicacion / m2_construidos o m2_terreno
+    if "precio_m2" in df.columns:
+        mask_needs_calc = (df["precio_m2"] == 0) | df["precio_m2"].isna()
+        area = df["m2_construidos"].where(df["m2_construidos"] > 0, df["m2_terreno"])
+        area = area.where(area > 0, 1)  # evitar división por 0
+        df.loc[mask_needs_calc, "precio_m2"] = (
+            df.loc[mask_needs_calc, "precio_publicacion"] / area[mask_needs_calc]
+        )
 
     # Rellenar categóricas con "Desconocido"
     for col in CATEGORICAL_FEATURES:
