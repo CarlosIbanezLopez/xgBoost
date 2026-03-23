@@ -15,9 +15,6 @@ APP_ENV = os.getenv("APP_ENV", "development")
 
 
 def _get_env_var(name: str, default: str | None = None, required_in_prod: bool = False) -> str:
-    """
-    Lee una variable de entorno con soporte para valores obligatorios en producción.
-    """
     value = os.getenv(name, default)
     if required_in_prod and APP_ENV == "production" and not value:
         raise RuntimeError(f"Missing required env var {name} in production")
@@ -37,9 +34,43 @@ POSTGRES_DSN = _get_env_var(
 MODEL_DIR = BASE_DIR / "models"
 MODEL_DIR.mkdir(exist_ok=True)
 
-REGRESSOR_PATH = MODEL_DIR / "xgb_regressor.joblib"
-REGRESSOR_NO_PUB_PATH = MODEL_DIR / "xgb_regressor_no_pub.joblib"
-CLASSIFIER_PATH = MODEL_DIR / "xgb_classifier.joblib"
-ENCODER_PATH = MODEL_DIR / "encoder.joblib"
-
 RANDOM_STATE = int(os.getenv("RANDOM_STATE", "42"))
+
+# ---------------------------------------------------------------------------
+# Segmentos válidos
+# ---------------------------------------------------------------------------
+# tipo_transaccion  segmento       modelo_idx
+# Venta             Residencial    1, 2  (con/sin precio_publicacion)
+# Venta             Comercial      3, 4
+# Alquiler          Residencial    5, 6  (con/sin precio_publicacion)
+# Alquiler          Comercial      7, 8
+
+VALID_COMBINATIONS: dict[tuple[str, str], tuple[int, int]] = {
+    ("Venta",    "Residencial"): (1, 2),
+    ("Venta",    "Comercial"):   (3, 4),
+    ("Alquiler", "Residencial"): (5, 6),
+    ("Alquiler", "Comercial"):   (7, 8),
+}
+
+
+def model_paths(model_idx: int) -> dict[str, Path]:
+    """Devuelve los paths de regressor y encoder para un índice de modelo."""
+    return {
+        "regressor":  MODEL_DIR / f"xgb_regressor_m{model_idx}.joblib",
+        "encoder":    MODEL_DIR / f"encoder_m{model_idx}.joblib",
+        "classifier": MODEL_DIR / f"xgb_classifier_m{model_idx}.joblib",
+    }
+
+
+def get_model_indices(tipo_transaccion: str, segmento: str) -> tuple[int, int]:
+    """
+    Retorna (idx_con_pub, idx_sin_pub) para la combinación dada.
+    Lanza ValueError si la combinación no es válida.
+    """
+    key = (tipo_transaccion, segmento)
+    if key not in VALID_COMBINATIONS:
+        raise ValueError(
+            f"Combinación no soportada: tipo_transaccion='{tipo_transaccion}', "
+            f"segmento='{segmento}'. Válidas: {list(VALID_COMBINATIONS.keys())}"
+        )
+    return VALID_COMBINATIONS[key]

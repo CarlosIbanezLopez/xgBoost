@@ -3,40 +3,41 @@ from __future__ import annotations
 import json
 import logging
 import os
-from typing import Literal, Optional
+from typing import Dict, Literal, Optional
 
 import numpy as np
 from fastapi import Depends, FastAPI, HTTPException, status
 from fastapi.security import APIKeyHeader
 from pydantic import BaseModel, Field
 
+from config import VALID_COMBINATIONS, get_model_indices
 from db import fetch_comparable_listings, fetch_nearest_zone_cluster
-from config import (
-    CLASSIFIER_PATH,
-    REGRESSOR_PATH,
-)
 from ml_pipeline import (
     CATEGORICAL_FEATURES,
-    NUMERIC_FEATURES,
-    load_classification_bundle,
-    load_regression_bundle,
-    load_regression_no_pub_bundle,
-    save_models,
-    train_models,
+    load_bundle,
+    save_all_bundles,
+    train_all_models,
 )
 
 
-app = FastAPI(title="XGBoost Property Service", version="1.0.0")
-
+app = FastAPI(title="XGBoost Property Service — Multi-Model", version="2.0.0")
 logger = logging.getLogger(__name__)
 
 
+# ---------------------------------------------------------------------------
+# Schemas
+# ---------------------------------------------------------------------------
+
 class TrainResponse(BaseModel):
-    reg_mae: float = Field(..., description="Mean Absolute Error del modelo de regresión")
+    results: list[dict] = Field(..., description="MAE y métricas por combinación entrenada")
 
 
 class PredictRequest(BaseModel):
-    # Numéricas
+    # --- Routing obligatorio ---
+    tipo_transaccion: Literal["Venta", "Alquiler"] = "Venta"
+    segmento: Literal["Residencial", "Comercial"] = "Residencial"
+
+    # --- Numéricas ---
     latitude: float
     longitude: float
     cluster_zona: Optional[int] = None
@@ -46,8 +47,8 @@ class PredictRequest(BaseModel):
     banos: int = 0
     estacionamientos: int = 0
     antiguedad: int = 0
-    # Si viene None o 0, se usará el modelo alternativo sin precio_publicacion
     precio_publicacion: Optional[float] = None
+    precio_alquiler_mes: Optional[float] = None   # nuevo
     precio_m2: Optional[float] = None
     tiempo_en_mercado: int = 0
     numero_reducciones: int = 0
@@ -56,7 +57,7 @@ class PredictRequest(BaseModel):
     mes_publicacion: int = 0
     anio_publicacion: int = 0
 
-    # Categóricas
+    # --- Categóricas ---
     tipo_propiedad: Optional[str] = "Casa"
     subtipo_original: Optional[str] = "Casa"
     categoria_propiedad: Optional[str] = "Casa"
@@ -72,15 +73,20 @@ class RegressionPrediction(BaseModel):
     expected_abs_error: float
     expected_pct_error: float
     interval_approx: dict
+    model_used: str = Field(..., description="Identificador del modelo usado")
     comparables: list[dict] = Field(default_factory=list)
 
 
 class ClassificationPrediction(BaseModel):
     price_segment: Literal["bajo", "medio", "alto"]
     probabilities: dict
+    model_used: str
 
 
-# --- Seguridad básica para /train ---
+# ---------------------------------------------------------------------------
+# Seguridad para /train
+# ---------------------------------------------------------------------------
+
 API_KEY_TRAIN = os.getenv("API_KEY_TRAIN")
 api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
 
@@ -98,40 +104,49 @@ async def require_train_key(api_key: str = Depends(api_key_header)):
         )
 
 
-@app.post("/train", response_model=TrainResponse, dependencies=[Depends(require_train_key)])
-def train_endpoint():
+# ---------------------------------------------------------------------------
+# Caché de bundles en memoria
+# ---------------------------------------------------------------------------
+
+_bundle_cache: Dict[tuple, dict] = {}
+
+
+def _get_bundle(tipo_transaccion: str, segmento: str) -> dict:
     """
-    Entrena ambos modelos (regresión y clasificación) leyendo datos desde Postgres.
+    Carga y cachea el bundle para la combinación solicitada.
     """
-    models = train_models()
-    save_models(models)
-    return TrainResponse(reg_mae=models.reg_mae)
+    key = (tipo_transaccion, segmento)
+    if key not in _bundle_cache:
+        try:
+            _bundle_cache[key] = load_bundle(tipo_transaccion, segmento)
+        except FileNotFoundError:
+            raise HTTPException(
+                status_code=500,
+                detail=(
+                    f"Modelos no encontrados para {tipo_transaccion}/{segmento}. "
+                    "Ejecuta primero POST /train."
+                ),
+            )
+    return _bundle_cache[key]
 
 
-_regression_bundle = None
-_regression_no_pub_bundle = None
-_classification_bundle = None
+def _invalidate_cache():
+    """Limpia el caché tras reentrenamiento."""
+    _bundle_cache.clear()
 
 
-def _load_bundles_or_500():
-    global _regression_bundle, _regression_no_pub_bundle, _classification_bundle
-    try:
-        if _regression_bundle is None or _regression_no_pub_bundle is None or _classification_bundle is None:
-            _regression_bundle = load_regression_bundle()
-            _regression_no_pub_bundle = load_regression_no_pub_bundle()
-            _classification_bundle = load_classification_bundle()
-    except FileNotFoundError:
-        raise HTTPException(
-            status_code=500,
-            detail="Modelos no encontrados. Ejecuta primero POST /train o corre ml_pipeline.py.",
-        )
-    return _regression_bundle, _regression_no_pub_bundle, _classification_bundle
+# ---------------------------------------------------------------------------
+# Feature preparation
+# ---------------------------------------------------------------------------
 
-
-def _prepare_feature_row(payload: PredictRequest, encoder, numeric_features, categorical_features):
+def _prepare_feature_row(
+    payload: PredictRequest,
+    bundle: dict,
+    use_no_pub: bool,
+) -> np.ndarray:
     data = payload.dict()
 
-    # Calcular cluster_zona/ciudad/pais desde coordenadas (si no vienen)
+    # Enriquecer con cluster/ciudad/pais si faltan
     if data.get("cluster_zona") in (None, 0) or not data.get("ciudad") or not data.get("pais"):
         nearest = fetch_nearest_zone_cluster(
             latitude=float(data["latitude"]),
@@ -145,72 +160,107 @@ def _prepare_feature_row(payload: PredictRequest, encoder, numeric_features, cat
             if not data.get("pais"):
                 data["pais"] = str(nearest.get("pais") or "")
 
-    # Calcular precio_m2 si no viene o viene en 0
+    # Calcular precio_m2 si falta
     if data.get("precio_m2") in (None, 0):
         area = data.get("m2_construidos") or data.get("m2_terreno") or 0
-        if area and area > 0 and (data.get("precio_publicacion") not in (None, 0)):
-            data["precio_m2"] = float(data["precio_publicacion"]) / float(area)
+        pub  = data.get("precio_publicacion") or 0
+        if area > 0 and pub > 0:
+            data["precio_m2"] = float(pub) / float(area)
         else:
             data["precio_m2"] = 0.0
 
-    # Mostrar en consola lo que entra al pipeline (enriquecido)
-    enriched_json = json.dumps(data, ensure_ascii=False)
-    print(f"[xgboost] input_enriched_json={enriched_json}", flush=True)
+    enriched_json = json.dumps(data, ensure_ascii=False, default=str)
     logger.info("XGBoost input (enriched): %s", enriched_json)
+    print(f"[xgboost] input_enriched_json={enriched_json}", flush=True)
 
-    def _num_value(col: str) -> float:
+    numeric_features = (
+        bundle["numeric_features_no_pub"] if use_no_pub
+        else bundle["numeric_features_pub"]
+    )
+    encoder = bundle["encoder"]
+
+    def _num(col: str) -> float:
         v = data.get(col, 0)
-        if v is None:
-            v = 0
-        return float(v)
+        return float(v) if v is not None else 0.0
 
-    X_num = np.array([[ _num_value(col) for col in numeric_features ]])
-    X_cat_raw = [[str(data.get(col, "Desconocido")) for col in categorical_features]]
+    X_num = np.array([[_num(c) for c in numeric_features]])
+    X_cat_raw = [[str(data.get(c, "Desconocido")) for c in CATEGORICAL_FEATURES]]
     X_cat = encoder.transform(X_cat_raw)
     X_row = np.hstack([X_num, X_cat])
 
-    # Mostrar en consola el vector numérico final que entra al modelo
-    x_vec = X_row.tolist()
-    print(f"[xgboost] input_vector_numeric={x_vec}", flush=True)
-    logger.info("XGBoost vector: %s", x_vec)
+    logger.info("XGBoost vector: %s", X_row.tolist())
     return X_row
+
+
+def _has_pub_price(payload: PredictRequest) -> bool:
+    """True si viene precio de publicación o alquiler válido."""
+    if payload.tipo_transaccion == "Alquiler":
+        return payload.precio_alquiler_mes not in (None, 0)
+    return payload.precio_publicacion not in (None, 0)
+
+
+# ---------------------------------------------------------------------------
+# Endpoints
+# ---------------------------------------------------------------------------
+
+@app.post("/train", response_model=TrainResponse, dependencies=[Depends(require_train_key)])
+def train_endpoint():
+    """
+    Entrena los 4 bundles (8 modelos) leyendo datos filtrados desde Postgres.
+    """
+    bundles = train_all_models()
+    save_all_bundles(bundles)
+    _invalidate_cache()
+
+    results = [
+        {
+            "tipo_transaccion": b.tipo_transaccion,
+            "segmento":         b.segmento,
+            "mae_pub":          round(b.reg_mae_pub, 2),
+            "mae_no_pub":       round(b.reg_mae_no_pub, 2),
+            "clf_accuracy":     round(b.clf_accuracy, 4),
+            "clf_f1_weighted":  round(b.clf_f1_weighted, 4),
+        }
+        for b in bundles.values()
+    ]
+    return TrainResponse(results=results)
 
 
 @app.post("/predict/regression", response_model=RegressionPrediction)
 def predict_regression(payload: PredictRequest):
     """
-    Predice el precio de venta de una propiedad.
+    Predice el precio de venta o alquiler de una propiedad.
+    Selecciona automáticamente el modelo correcto según
+    tipo_transaccion + segmento del request.
     """
-    reg_bundle, reg_no_pub_bundle, _ = _load_bundles_or_500()
+    # Validar combinación
+    try:
+        idx_pub, idx_no_pub = get_model_indices(payload.tipo_transaccion, payload.segmento)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
 
-    use_no_pub = payload.precio_publicacion in (None, 0)
-    active_bundle = reg_no_pub_bundle if use_no_pub else reg_bundle
+    bundle = _get_bundle(payload.tipo_transaccion, payload.segmento)
+    use_no_pub = not _has_pub_price(payload)
+    model_tag = (
+        f"m{idx_no_pub}_{payload.tipo_transaccion}_{payload.segmento}_no_pub"
+        if use_no_pub
+        else f"m{idx_pub}_{payload.tipo_transaccion}_{payload.segmento}_pub"
+    )
 
-    regressor = active_bundle["regressor"]
-    encoder = active_bundle["encoder"]
-    numeric_features = active_bundle.get("numeric_features", NUMERIC_FEATURES)
-    categorical_features = active_bundle.get("categorical_features", CATEGORICAL_FEATURES)
-    reg_mae = float(active_bundle.get("reg_mae", 0.0))
-    price_bins = np.array(active_bundle.get("price_bins"))
-    mean_abs_pct_error_by_bin = np.array(active_bundle.get("mean_abs_pct_error_by_bin"))
+    X_row = _prepare_feature_row(payload, bundle, use_no_pub)
 
-    X_row = _prepare_feature_row(payload, encoder, numeric_features, categorical_features)
+    regressor = bundle["regressor_no_pub"] if use_no_pub else bundle["regressor_pub"]
     pred = float(regressor.predict(X_row)[0])
 
-    # Error absoluto esperado global (para compatibilidad)
-    expected_abs_error = reg_mae
+    # Error esperado
+    reg_mae = bundle["reg_mae_no_pub"] if use_no_pub else bundle["reg_mae_pub"]
+    price_bins = bundle["price_bins_no_pub"] if use_no_pub else bundle["price_bins_pub"]
+    pct_errors = bundle["mean_abs_pct_error_no_pub"] if use_no_pub else bundle["mean_abs_pct_error_pub"]
 
-    # Error porcentual esperado según el rango de precio predicho
-    if price_bins is not None and mean_abs_pct_error_by_bin is not None:
-        # encontrar el bin para este precio predicho
-        bin_idx = int(np.digitize(pred, price_bins, right=True) - 1)
-        bin_idx = max(0, min(bin_idx, len(mean_abs_pct_error_by_bin) - 1))
-        expected_pct_error = float(mean_abs_pct_error_by_bin[bin_idx])
-    else:
-        # fallback: usar MAE global sobre el propio precio
-        expected_pct_error = float(expected_abs_error / pred) if pred != 0 else 0.0
+    bin_idx = int(np.digitize(pred, price_bins, right=True) - 1)
+    bin_idx = max(0, min(bin_idx, len(pct_errors) - 1))
+    expected_pct_error = float(pct_errors[bin_idx])
 
-    # Intervalo aproximado basado en el error porcentual
     lower = max(pred * (1.0 - expected_pct_error), 0.0)
     upper = pred * (1.0 + expected_pct_error)
 
@@ -220,6 +270,8 @@ def predict_regression(payload: PredictRequest):
         ciudad=payload.ciudad,
         pais=payload.pais,
         tipo_propiedad=payload.tipo_propiedad,
+        segmento=payload.segmento,
+        tipo_transaccion=payload.tipo_transaccion,
         m2_construidos=payload.m2_construidos,
         m2_terreno=payload.m2_terreno,
         limit=20,
@@ -227,9 +279,10 @@ def predict_regression(payload: PredictRequest):
 
     return RegressionPrediction(
         predicted_price=pred,
-        expected_abs_error=expected_abs_error,
+        expected_abs_error=float(reg_mae),
         expected_pct_error=expected_pct_error,
         interval_approx={"lower": lower, "upper": upper},
+        model_used=model_tag,
         comparables=comparables,
     )
 
@@ -239,23 +292,47 @@ def predict_classification(payload: PredictRequest):
     """
     Clasifica la propiedad en segmento de precio (bajo/medio/alto).
     """
-    _, _, clf_bundle = _load_bundles_or_500()
-    classifier = clf_bundle["classifier"]
-    encoder = clf_bundle["encoder"]
-    numeric_features = clf_bundle.get("numeric_features", NUMERIC_FEATURES)
-    categorical_features = clf_bundle.get("categorical_features", CATEGORICAL_FEATURES)
+    try:
+        idx_pub, _ = get_model_indices(payload.tipo_transaccion, payload.segmento)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
 
-    X_row = _prepare_feature_row(payload, encoder, numeric_features, categorical_features)
+    bundle = _get_bundle(payload.tipo_transaccion, payload.segmento)
+    model_tag = f"m{idx_pub}_{payload.tipo_transaccion}_{payload.segmento}_clf"
+
+    # El classifier siempre usa las features con precio_publicacion
+    X_row = _prepare_feature_row(payload, bundle, use_no_pub=False)
+
+    classifier = bundle["classifier"]
     probs = classifier.predict_proba(X_row)[0]
 
     idx_to_label = {0: "bajo", 1: "medio", 2: "alto"}
     label = idx_to_label[int(np.argmax(probs))]
     prob_dict = {idx_to_label[i]: float(p) for i, p in enumerate(probs)}
 
-    return ClassificationPrediction(price_segment=label, probabilities=prob_dict)
+    return ClassificationPrediction(
+        price_segment=label,
+        probabilities=prob_dict,
+        model_used=model_tag,
+    )
+
+
+@app.get("/models", summary="Lista los modelos disponibles y sus combinaciones")
+def list_models():
+    return {
+        "combinations": [
+            {
+                "tipo_transaccion": tt,
+                "segmento": seg,
+                "model_idx_pub": idxs[0],
+                "model_idx_no_pub": idxs[1],
+                "loaded": (tt, seg) in _bundle_cache,
+            }
+            for (tt, seg), idxs in VALID_COMBINATIONS.items()
+        ]
+    }
 
 
 @app.get("/health")
 def health():
-    return {"status": "ok"}
-
+    return {"status": "ok", "models_cached": len(_bundle_cache)}
