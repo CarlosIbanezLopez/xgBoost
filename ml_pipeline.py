@@ -16,6 +16,7 @@ from config import (
     ENCODER_PATH,
     RANDOM_STATE,
     REGRESSOR_PATH,
+    REGRESSOR_NO_PUB_PATH,
 )
 from db import fetch_property_analytics
 
@@ -40,6 +41,8 @@ NUMERIC_FEATURES: List[str] = [
     "anio_publicacion",
 ]
 
+NUMERIC_FEATURES_NO_PUB: List[str] = [c for c in NUMERIC_FEATURES if c != "precio_publicacion"]
+
 CATEGORICAL_FEATURES: List[str] = [
     "tipo_propiedad",
     "subtipo_original",
@@ -55,14 +58,18 @@ CATEGORICAL_FEATURES: List[str] = [
 @dataclass
 class TrainedModels:
     regressor: XGBRegressor
+    regressor_no_pub: XGBRegressor
     classifier: XGBClassifier
     encoder: OrdinalEncoder
     reg_mae: float
+    reg_mae_no_pub: float
     clf_accuracy: float
     clf_f1_weighted: float
     # métricas de error relativo por rango de precio
     price_bins: np.ndarray
     mean_abs_pct_error_by_bin: np.ndarray
+    price_bins_no_pub: np.ndarray
+    mean_abs_pct_error_by_bin_no_pub: np.ndarray
 
 
 def _build_features(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.Series, pd.Series]:
@@ -126,15 +133,18 @@ def train_models(test_size: float = 0.2) -> TrainedModels:
 
     # Separar numéricas y categóricas
     X_num = X_raw[NUMERIC_FEATURES].astype(float)
+    X_num_no_pub = X_raw[NUMERIC_FEATURES_NO_PUB].astype(float)
     X_cat = X_raw[CATEGORICAL_FEATURES].astype(str)
 
     encoder = OrdinalEncoder(handle_unknown="use_encoded_value", unknown_value=-1)
     X_cat_enc = encoder.fit_transform(X_cat)
 
     X_full = np.hstack([X_num.values, X_cat_enc])
+    X_full_no_pub = np.hstack([X_num_no_pub.values, X_cat_enc])
 
-    X_train, X_test, y_reg_train, y_reg_test, y_clf_train, y_clf_test = train_test_split(
+    X_train, X_test, X_train_no_pub, X_test_no_pub, y_reg_train, y_reg_test, y_clf_train, y_clf_test = train_test_split(
         X_full,
+        X_full_no_pub,
         y_reg,
         y_clf,
         test_size=test_size,
@@ -181,6 +191,42 @@ def train_models(test_size: float = 0.2) -> TrainedModels:
             mean_abs_pct_error_by_bin.append(float(abs_pct_error[mask].mean()))
     mean_abs_pct_error_by_bin = np.array(mean_abs_pct_error_by_bin)
 
+    # Regresor alternativo sin precio_publicacion
+    regressor_no_pub = XGBRegressor(
+        n_estimators=400,
+        learning_rate=0.05,
+        max_depth=6,
+        subsample=0.8,
+        colsample_bytree=0.8,
+        objective="reg:squarederror",
+        random_state=RANDOM_STATE,
+        n_jobs=-1,
+    )
+    regressor_no_pub.fit(X_train_no_pub, y_reg_train)
+
+    y_reg_pred_no_pub = regressor_no_pub.predict(X_test_no_pub)
+    reg_mae_no_pub = float(mean_absolute_error(y_reg_test, y_reg_pred_no_pub))
+
+    denom_no_pub = np.clip(np.abs(y_reg_test.values), 1e-6, None)
+    abs_pct_error_no_pub = np.abs(y_reg_test.values - y_reg_pred_no_pub) / denom_no_pub
+
+    price_bins_no_pub = np.quantile(y_reg_pred_no_pub, [0.0, 0.25, 0.5, 0.75, 1.0])
+    price_bins_no_pub = np.unique(price_bins_no_pub)
+    if price_bins_no_pub.shape[0] < 2:
+        price_bins_no_pub = np.array([y_reg_pred_no_pub.min(), y_reg_pred_no_pub.max()])
+
+    bin_indices_no_pub = np.digitize(y_reg_pred_no_pub, price_bins_no_pub, right=True) - 1
+    bin_indices_no_pub = np.clip(bin_indices_no_pub, 0, price_bins_no_pub.shape[0] - 2)
+
+    mean_abs_pct_error_by_bin_no_pub = []
+    for b in range(price_bins_no_pub.shape[0] - 1):
+        mask = bin_indices_no_pub == b
+        if not np.any(mask):
+            mean_abs_pct_error_by_bin_no_pub.append(float(abs_pct_error_no_pub.mean()))
+        else:
+            mean_abs_pct_error_by_bin_no_pub.append(float(abs_pct_error_no_pub[mask].mean()))
+    mean_abs_pct_error_by_bin_no_pub = np.array(mean_abs_pct_error_by_bin_no_pub)
+
     # Clasificador usando las mismas features (sin data leakage)
     classifier = XGBClassifier(
         n_estimators=300,
@@ -201,13 +247,17 @@ def train_models(test_size: float = 0.2) -> TrainedModels:
 
     return TrainedModels(
         regressor=regressor,
+        regressor_no_pub=regressor_no_pub,
         classifier=classifier,
         encoder=encoder,
         reg_mae=reg_mae,
+        reg_mae_no_pub=reg_mae_no_pub,
         clf_accuracy=clf_accuracy,
         clf_f1_weighted=clf_f1_weighted,
         price_bins=price_bins,
         mean_abs_pct_error_by_bin=mean_abs_pct_error_by_bin,
+        price_bins_no_pub=price_bins_no_pub,
+        mean_abs_pct_error_by_bin_no_pub=mean_abs_pct_error_by_bin_no_pub,
     )
 
 
@@ -240,6 +290,21 @@ def save_models(models: TrainedModels) -> None:
         REGRESSOR_PATH,
     )
 
+    # Bundle de regresión alternativo sin precio_publicacion
+    joblib.dump(
+        {
+            "regressor": models.regressor_no_pub,
+            "numeric_features": NUMERIC_FEATURES_NO_PUB,
+            "categorical_features": CATEGORICAL_FEATURES,
+            "reg_mae": models.reg_mae_no_pub,
+            "clf_accuracy": models.clf_accuracy,
+            "clf_f1_weighted": models.clf_f1_weighted,
+            "price_bins": models.price_bins_no_pub,
+            "mean_abs_pct_error_by_bin": models.mean_abs_pct_error_by_bin_no_pub,
+        },
+        REGRESSOR_NO_PUB_PATH,
+    )
+
     # Bundle de clasificación
     joblib.dump(
         {
@@ -256,6 +321,13 @@ def save_models(models: TrainedModels) -> None:
 
 def load_regression_bundle():
     bundle = joblib.load(REGRESSOR_PATH)
+    encoder_bundle = joblib.load(ENCODER_PATH)
+    bundle["encoder"] = encoder_bundle["encoder"]
+    return bundle
+
+
+def load_regression_no_pub_bundle():
+    bundle = joblib.load(REGRESSOR_NO_PUB_PATH)
     encoder_bundle = joblib.load(ENCODER_PATH)
     bundle["encoder"] = encoder_bundle["encoder"]
     return bundle

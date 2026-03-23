@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+import logging
 import os
 from typing import Literal, Optional
 
@@ -8,7 +10,7 @@ from fastapi import Depends, FastAPI, HTTPException, status
 from fastapi.security import APIKeyHeader
 from pydantic import BaseModel, Field
 
-from db import fetch_comparable_listings
+from db import fetch_comparable_listings, fetch_nearest_zone_cluster
 from config import (
     CLASSIFIER_PATH,
     REGRESSOR_PATH,
@@ -18,12 +20,15 @@ from ml_pipeline import (
     NUMERIC_FEATURES,
     load_classification_bundle,
     load_regression_bundle,
+    load_regression_no_pub_bundle,
     save_models,
     train_models,
 )
 
 
 app = FastAPI(title="XGBoost Property Service", version="1.0.0")
+
+logger = logging.getLogger(__name__)
 
 
 class TrainResponse(BaseModel):
@@ -34,14 +39,15 @@ class PredictRequest(BaseModel):
     # Numéricas
     latitude: float
     longitude: float
-    cluster_zona: int = 0
+    cluster_zona: Optional[int] = None
     m2_construidos: float = 0
     m2_terreno: float = 0
     dormitorios: int = 0
     banos: int = 0
     estacionamientos: int = 0
     antiguedad: int = 0
-    precio_publicacion: float = 0
+    # Si viene None o 0, se usará el modelo alternativo sin precio_publicacion
+    precio_publicacion: Optional[float] = None
     precio_m2: Optional[float] = None
     tiempo_en_mercado: int = 0
     numero_reducciones: int = 0
@@ -55,8 +61,8 @@ class PredictRequest(BaseModel):
     subtipo_original: Optional[str] = "Casa"
     categoria_propiedad: Optional[str] = "Casa"
     estado_propiedad: Optional[str] = "Sin especificar"
-    ciudad: Optional[str] = "Santa Cruz de la Sierra"
-    pais: Optional[str] = "Bolivia"
+    ciudad: Optional[str] = None
+    pais: Optional[str] = None
     status: Optional[str] = "Activa"
     transaction_type: Optional[str] = "Venta"
 
@@ -103,38 +109,71 @@ def train_endpoint():
 
 
 _regression_bundle = None
+_regression_no_pub_bundle = None
 _classification_bundle = None
 
 
 def _load_bundles_or_500():
-    global _regression_bundle, _classification_bundle
+    global _regression_bundle, _regression_no_pub_bundle, _classification_bundle
     try:
-        if _regression_bundle is None or _classification_bundle is None:
+        if _regression_bundle is None or _regression_no_pub_bundle is None or _classification_bundle is None:
             _regression_bundle = load_regression_bundle()
+            _regression_no_pub_bundle = load_regression_no_pub_bundle()
             _classification_bundle = load_classification_bundle()
     except FileNotFoundError:
         raise HTTPException(
             status_code=500,
             detail="Modelos no encontrados. Ejecuta primero POST /train o corre ml_pipeline.py.",
         )
-    return _regression_bundle, _classification_bundle
+    return _regression_bundle, _regression_no_pub_bundle, _classification_bundle
 
 
 def _prepare_feature_row(payload: PredictRequest, encoder, numeric_features, categorical_features):
     data = payload.dict()
 
+    # Calcular cluster_zona/ciudad/pais desde coordenadas (si no vienen)
+    if data.get("cluster_zona") in (None, 0) or not data.get("ciudad") or not data.get("pais"):
+        nearest = fetch_nearest_zone_cluster(
+            latitude=float(data["latitude"]),
+            longitude=float(data["longitude"]),
+        )
+        if nearest:
+            if data.get("cluster_zona") in (None, 0):
+                data["cluster_zona"] = int(nearest["cluster_id"])
+            if not data.get("ciudad"):
+                data["ciudad"] = str(nearest["ciudad"])
+            if not data.get("pais"):
+                data["pais"] = str(nearest.get("pais") or "")
+
     # Calcular precio_m2 si no viene o viene en 0
     if data.get("precio_m2") in (None, 0):
         area = data.get("m2_construidos") or data.get("m2_terreno") or 0
-        if area and area > 0:
+        if area and area > 0 and (data.get("precio_publicacion") not in (None, 0)):
             data["precio_m2"] = float(data["precio_publicacion"]) / float(area)
         else:
             data["precio_m2"] = 0.0
 
-    X_num = np.array([[float(data.get(col, 0)) for col in numeric_features]])
+    # Mostrar en consola lo que entra al pipeline (enriquecido)
+    enriched_json = json.dumps(data, ensure_ascii=False)
+    print(f"[xgboost] input_enriched_json={enriched_json}", flush=True)
+    logger.info("XGBoost input (enriched): %s", enriched_json)
+
+    def _num_value(col: str) -> float:
+        v = data.get(col, 0)
+        if v is None:
+            v = 0
+        return float(v)
+
+    X_num = np.array([[ _num_value(col) for col in numeric_features ]])
     X_cat_raw = [[str(data.get(col, "Desconocido")) for col in categorical_features]]
     X_cat = encoder.transform(X_cat_raw)
-    return np.hstack([X_num, X_cat])
+    X_row = np.hstack([X_num, X_cat])
+
+    # Mostrar en consola el vector numérico final que entra al modelo
+    x_vec = X_row.tolist()
+    print(f"[xgboost] input_vector_numeric={x_vec}", flush=True)
+    logger.info("XGBoost vector: %s", x_vec)
+    return X_row
 
 
 @app.post("/predict/regression", response_model=RegressionPrediction)
@@ -142,14 +181,18 @@ def predict_regression(payload: PredictRequest):
     """
     Predice el precio de venta de una propiedad.
     """
-    reg_bundle, _ = _load_bundles_or_500()
-    regressor = reg_bundle["regressor"]
-    encoder = reg_bundle["encoder"]
-    numeric_features = reg_bundle.get("numeric_features", NUMERIC_FEATURES)
-    categorical_features = reg_bundle.get("categorical_features", CATEGORICAL_FEATURES)
-    reg_mae = float(reg_bundle.get("reg_mae", 0.0))
-    price_bins = np.array(reg_bundle.get("price_bins"))
-    mean_abs_pct_error_by_bin = np.array(reg_bundle.get("mean_abs_pct_error_by_bin"))
+    reg_bundle, reg_no_pub_bundle, _ = _load_bundles_or_500()
+
+    use_no_pub = payload.precio_publicacion in (None, 0)
+    active_bundle = reg_no_pub_bundle if use_no_pub else reg_bundle
+
+    regressor = active_bundle["regressor"]
+    encoder = active_bundle["encoder"]
+    numeric_features = active_bundle.get("numeric_features", NUMERIC_FEATURES)
+    categorical_features = active_bundle.get("categorical_features", CATEGORICAL_FEATURES)
+    reg_mae = float(active_bundle.get("reg_mae", 0.0))
+    price_bins = np.array(active_bundle.get("price_bins"))
+    mean_abs_pct_error_by_bin = np.array(active_bundle.get("mean_abs_pct_error_by_bin"))
 
     X_row = _prepare_feature_row(payload, encoder, numeric_features, categorical_features)
     pred = float(regressor.predict(X_row)[0])
@@ -196,7 +239,7 @@ def predict_classification(payload: PredictRequest):
     """
     Clasifica la propiedad en segmento de precio (bajo/medio/alto).
     """
-    _, clf_bundle = _load_bundles_or_500()
+    _, _, clf_bundle = _load_bundles_or_500()
     classifier = clf_bundle["classifier"]
     encoder = clf_bundle["encoder"]
     numeric_features = clf_bundle.get("numeric_features", NUMERIC_FEATURES)

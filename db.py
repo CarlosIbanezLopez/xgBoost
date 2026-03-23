@@ -181,3 +181,65 @@ def fetch_comparable_listings(
         rows = conn.execute(query, params).mappings().all()
     return [dict(r) for r in rows]
 
+
+#def fetch_nearest_zone_cluster(*, latitude: float, longitude: float) -> dict | None:
+#    """
+#    Busca el centroide más cercano en `public.zona_clusters` y retorna:
+#    {cluster_id, ciudad, pais, centroide_lat, centroide_lng}
+#    """
+#    query = text(
+#        """
+#        SELECT
+#            cluster_id,
+#            ciudad,
+#            pais,
+#            centroide_lat,
+#            centroide_lng
+#        FROM public.zona_clusters
+#        ORDER BY (
+#            (centroide_lat - :lat0) * (centroide_lat - :lat0)
+#            + (centroide_lng - :lon0) * (centroide_lng - :lon0)
+#        ) ASC
+#        LIMIT 1
+#        """
+#    )
+#    with get_connection() as conn:
+#        row = conn.execute(
+#            query, {"lat0": float(latitude), "lon0": float(longitude)}
+#        ).mappings().first()
+#    return dict(row) if row else None
+
+def fetch_nearest_zone_cluster(*, latitude: float, longitude: float) -> dict | None:
+    """
+    Busca el centroide (cluster_id) más cercano a las coordenadas recibidas.
+
+    Implementación basada en `public.zona_clusters`:
+    - calcula distancia Euclidiana en el espacio (centroide_lat, centroide_lng)
+    - retorna el cluster_id con distancia mínima
+
+    Esto evita errores por solapamiento de bounding boxes al inferir ciudad.
+    """
+    query = text(
+        """
+        SELECT
+            cluster_id,
+            ciudad,
+            pais,
+            centroide_lat,
+            centroide_lng
+        FROM public.zona_clusters
+        ORDER BY (
+            (centroide_lat - :lat0) * (centroide_lat - :lat0)
+            + (centroide_lng - :lon0) * (centroide_lng - :lon0)
+        ) ASC
+        LIMIT 1
+        """
+    )
+
+    with get_connection() as conn:
+        row = conn.execute(
+            query,
+            {"lat0": float(latitude), "lon0": float(longitude)},
+        ).mappings().first()
+
+    return dict(row) if row else None

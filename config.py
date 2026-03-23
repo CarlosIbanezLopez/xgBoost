@@ -38,6 +38,7 @@ MODEL_DIR = BASE_DIR / "models"
 MODEL_DIR.mkdir(exist_ok=True)
 
 REGRESSOR_PATH = MODEL_DIR / "xgb_regressor.joblib"
+REGRESSOR_NO_PUB_PATH = MODEL_DIR / "xgb_regressor_no_pub.joblib"
 CLASSIFIER_PATH = MODEL_DIR / "xgb_classifier.joblib"
 ENCODER_PATH = MODEL_DIR / "encoder.joblib"
 
