@@ -8,7 +8,6 @@ from sqlalchemy.engine import Engine
 
 from config import POSTGRES_DSN
 
-
 logger = logging.getLogger(__name__)
 
 _engine: Engine | None = None
@@ -49,22 +48,19 @@ def fetch_property_analytics(
     limit: int | None = None,
 ) -> pd.DataFrame:
     """
-    Carga los datos desde Postgres, opcionalmente filtrados por
-    tipo_transaccion y/o segmento para entrenar modelos especializados.
+    Carga datos desde Postgres filtrando opcionalmente por tipo_transaccion y segmento.
+    Solo trae las columnas necesarias para entrenamiento (sin mlsid, cluster_zona,
+    subtipo_original, categoria_propiedad, status, transaction_type).
     """
     base_query = """
         SELECT
             id_propiedad,
-            mlsid,
             tipo_propiedad,
-            subtipo_original,
-            categoria_propiedad,
             estado_propiedad,
             segmento,
             tipo_transaccion,
             latitude,
             longitude,
-            cluster_zona,
             ciudad,
             pais,
             m2_construidos,
@@ -84,8 +80,6 @@ def fetch_property_analytics(
             mes_publicacion,
             anio_publicacion,
             fecha_venta,
-            status,
-            transaction_type,
             fecha_carga,
             fecha_actualizacion
         FROM public.property_analytics
@@ -115,12 +109,8 @@ def fetch_property_analytics(
 
     logger.info(
         "Loaded %d rows (tipo_transaccion=%s, segmento=%s) in %.3f s",
-        len(df),
-        tipo_transaccion,
-        segmento,
-        elapsed,
+        len(df), tipo_transaccion, segmento, elapsed,
     )
-
     return df
 
 
@@ -138,8 +128,7 @@ def fetch_comparable_listings(
     limit: int = 20,
 ) -> list[dict]:
     """
-    Devuelve comparables desde la tabla, filtrados también por segmento
-    y tipo_transaccion para mayor relevancia.
+    Comparables geográficamente cercanos y similares en área, segmento y tipo de transacción.
     """
     area = m2_construidos if m2_construidos and m2_construidos > 0 else m2_terreno
     min_area = area * 0.7 if area and area > 0 else 0
@@ -149,8 +138,8 @@ def fetch_comparable_listings(
         """
         SELECT
             id_propiedad,
-            mlsid,
             tipo_propiedad,
+            estado_propiedad,
             segmento,
             tipo_transaccion,
             ciudad,
@@ -163,9 +152,8 @@ def fetch_comparable_listings(
             precio_venta,
             precio_alquiler_mes,
             precio_m2,
-            fecha_venta,
-            status,
-            transaction_type
+            tiempo_en_mercado,
+            fecha_venta
         FROM public.property_analytics
         WHERE
             (:ciudad IS NULL OR ciudad = :ciudad)
@@ -179,8 +167,12 @@ def fetch_comparable_listings(
                 (m2_construidos BETWEEN :min_area AND :max_area)
                 OR (m2_terreno BETWEEN :min_area AND :max_area)
             )
-            AND (precio_venta IS NOT NULL OR precio_publicacion IS NOT NULL OR precio_alquiler_mes IS NOT NULL)
-            AND ABS(latitude - :lat0) <= 0.2
+            AND (
+                precio_venta IS NOT NULL
+                OR precio_publicacion IS NOT NULL
+                OR precio_alquiler_mes IS NOT NULL
+            )
+            AND ABS(latitude  - :lat0) <= 0.2
             AND ABS(longitude - :lon0) <= 0.2
         ORDER BY (ABS(latitude - :lat0) + ABS(longitude - :lon0)) ASC
         LIMIT :limit
@@ -207,7 +199,8 @@ def fetch_comparable_listings(
 
 def fetch_nearest_zone_cluster(*, latitude: float, longitude: float) -> dict | None:
     """
-    Busca el centroide (cluster_id) más cercano a las coordenadas recibidas.
+    Busca el centroide más cercano en zona_clusters para inferir ciudad/pais
+    cuando no vienen en el request.
     """
     query = text(
         """
@@ -225,11 +218,8 @@ def fetch_nearest_zone_cluster(*, latitude: float, longitude: float) -> dict | N
         LIMIT 1
         """
     )
-
     with get_connection() as conn:
         row = conn.execute(
-            query,
-            {"lat0": float(latitude), "lon0": float(longitude)},
+            query, {"lat0": float(latitude), "lon0": float(longitude)}
         ).mappings().first()
-
     return dict(row) if row else None

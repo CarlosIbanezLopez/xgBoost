@@ -10,7 +10,6 @@ ENV_PATH = BASE_DIR / ".env"
 if ENV_PATH.exists():
     load_dotenv(ENV_PATH)
 
-
 APP_ENV = os.getenv("APP_ENV", "development")
 
 
@@ -37,13 +36,13 @@ MODEL_DIR.mkdir(exist_ok=True)
 RANDOM_STATE = int(os.getenv("RANDOM_STATE", "42"))
 
 # ---------------------------------------------------------------------------
-# Segmentos válidos
+# Combinaciones válidas: (tipo_transaccion, segmento) → (idx_con_pub, idx_sin_pub)
+#
+#   Venta    + Residencial → modelos 1 (con pub) y 2 (sin pub)
+#   Venta    + Comercial   → modelos 3 y 4
+#   Alquiler + Residencial → modelos 5 y 6
+#   Alquiler + Comercial   → modelos 7 y 8
 # ---------------------------------------------------------------------------
-# tipo_transaccion  segmento       modelo_idx
-# Venta             Residencial    1, 2  (con/sin precio_publicacion)
-# Venta             Comercial      3, 4
-# Alquiler          Residencial    5, 6  (con/sin precio_publicacion)
-# Alquiler          Comercial      7, 8
 
 VALID_COMBINATIONS: dict[tuple[str, str], tuple[int, int]] = {
     ("Venta",    "Residencial"): (1, 2),
@@ -54,7 +53,7 @@ VALID_COMBINATIONS: dict[tuple[str, str], tuple[int, int]] = {
 
 
 def model_paths(model_idx: int) -> dict[str, Path]:
-    """Devuelve los paths de regressor y encoder para un índice de modelo."""
+    """Paths de artefactos para un índice de modelo."""
     return {
         "regressor":  MODEL_DIR / f"xgb_regressor_m{model_idx}.joblib",
         "encoder":    MODEL_DIR / f"encoder_m{model_idx}.joblib",
@@ -63,10 +62,7 @@ def model_paths(model_idx: int) -> dict[str, Path]:
 
 
 def get_model_indices(tipo_transaccion: str, segmento: str) -> tuple[int, int]:
-    """
-    Retorna (idx_con_pub, idx_sin_pub) para la combinación dada.
-    Lanza ValueError si la combinación no es válida.
-    """
+    """Retorna (idx_con_pub, idx_sin_pub) o lanza ValueError si la combinación no existe."""
     key = (tipo_transaccion, segmento)
     if key not in VALID_COMBINATIONS:
         raise ValueError(
