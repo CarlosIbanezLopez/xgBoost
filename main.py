@@ -12,7 +12,11 @@ from fastapi.security import APIKeyHeader
 from pydantic import BaseModel, Field
 
 from config import VALID_COMBINATIONS, get_model_indices
-from db import fetch_comparable_listings, fetch_nearest_zone_cluster
+from db import (
+    fetch_comparable_listings,
+    fetch_location_market_stats,
+    fetch_nearest_zone_cluster,
+)
 from ml_pipeline import (
     CATEGORICAL_FEATURES,
     NUMERIC_FEATURES_SALE_PROB,
@@ -168,6 +172,62 @@ def _enrich(data: dict) -> dict:
     return data
 
 
+def _has_price_basis(data: dict) -> bool:
+    if float(data.get("precio_m2") or 0) > 0:
+        return True
+    if float(data.get("precio_publicacion") or 0) > 0:
+        return True
+    if data.get("tipo_transaccion") == "Alquiler":
+        return float(data.get("precio_alquiler_mes") or 0) > 0
+    return False
+
+
+def _apply_market_fallbacks(data: dict, *, use_no_pub: bool) -> dict:
+    """
+    Cuando falta precio_publicacion, estima señales de mercado desde la zona.
+
+    Esto evita que el modelo no_pub vea precio_m2=0 para cualquier coordenada
+    y termine devolviendo respuestas demasiado parecidas entre zonas distintas.
+    """
+    needs_precio_m2 = data.get("precio_m2") in (None, 0)
+    needs_ratio = data.get("ratio_activas_vendidas_zona") in (None, 0)
+
+    if not use_no_pub and not needs_ratio:
+        return data
+    if not needs_precio_m2 and not needs_ratio:
+        return data
+    if not use_no_pub and _has_price_basis(data):
+        return data
+
+    market = fetch_location_market_stats(
+        latitude=float(data["latitude"]),
+        longitude=float(data["longitude"]),
+        tipo_transaccion=str(data["tipo_transaccion"]),
+        segmento=str(data["segmento"]),
+        ciudad=data.get("ciudad"),
+        pais=data.get("pais"),
+    )
+    if not market:
+        return data
+
+    if not data.get("ciudad") and market.get("ciudad"):
+        data["ciudad"] = str(market["ciudad"])
+    if not data.get("pais") and market.get("pais"):
+        data["pais"] = str(market["pais"])
+
+    if needs_precio_m2 and not _has_price_basis(data):
+        precio_m2_mediana = float(market.get("precio_m2_mediana") or 0.0)
+        if precio_m2_mediana > 0:
+            data["precio_m2"] = precio_m2_mediana
+
+    if needs_ratio:
+        ratio = float(market.get("ratio_activas_vendidas_zona") or 0.0)
+        if ratio > 0:
+            data["ratio_activas_vendidas_zona"] = ratio
+
+    return data
+
+
 def _build_X(
     data: dict,
     numeric_features: list[str],
@@ -250,6 +310,7 @@ def predict_regression(payload: PredictRequest):
     use_no_pub = not _has_pub_price(payload)
 
     data = _enrich(payload.dict())
+    data = _apply_market_fallbacks(data, use_no_pub=use_no_pub)
     _log_input(data, "regression")
 
     numeric_features = (
@@ -279,13 +340,16 @@ def predict_regression(payload: PredictRequest):
     comparables = fetch_comparable_listings(
         latitude=payload.latitude,
         longitude=payload.longitude,
-        ciudad=payload.ciudad,
-        pais=payload.pais,
-        tipo_propiedad=payload.tipo_propiedad,
+        ciudad=data.get("ciudad"),
+        pais=data.get("pais"),
+        tipo_propiedad=data.get("tipo_propiedad"),
         segmento=payload.segmento,
         tipo_transaccion=payload.tipo_transaccion,
         m2_construidos=payload.m2_construidos,
         m2_terreno=payload.m2_terreno,
+        dormitorios=int(data.get("dormitorios") or 0),
+        banos=int(data.get("banos") or 0),
+        precio_m2_referencia=float(data.get("precio_m2") or 0.0),
         limit=20,
     )
 
