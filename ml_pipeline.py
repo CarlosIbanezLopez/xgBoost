@@ -60,7 +60,6 @@ NUMERIC_FEATURES_ALQUILER: List[str] = [
     "estacionamientos",
     "antiguedad",
     "precio_publicacion",
-    "precio_alquiler_mes",
     "precio_m2",
     "tiempo_en_mercado",
     "numero_reducciones",
@@ -71,8 +70,16 @@ NUMERIC_FEATURES_ALQUILER: List[str] = [
 ]
 
 NUMERIC_FEATURES_ALQUILER_NO_PUB: List[str] = [
-    c for c in NUMERIC_FEATURES_ALQUILER
-    if c not in ("precio_publicacion", "precio_alquiler_mes")
+    "latitude",
+    "longitude",
+    "m2_construidos",
+    "m2_terreno",
+    "dormitorios",
+    "banos",
+    "estacionamientos",
+    "antiguedad",
+    "precio_m2",
+    "ratio_activas_vendidas_zona",
 ]
 
 # Categóricas escalables — el encoder aprende los valores de los datos
@@ -224,6 +231,58 @@ def _compute_pct_bins(y_true: np.ndarray, y_pred: np.ndarray) -> Tuple[np.ndarra
     return bins, np.array(means)
 
 
+def _apply_alquiler_no_pub_context(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Reemplaza señales dependientes del precio/listado por contexto de mercado.
+
+    Esto alinea el training del modelo no_pub de alquiler con la inferencia real,
+    donde solo tenemos ubicación + atributos básicos y estimamos el contexto
+    local a partir de la zona/ciudad.
+    """
+    df = df.copy()
+    if "precio_m2" not in df.columns or "ratio_activas_vendidas_zona" not in df.columns:
+        return df
+
+    cluster_pm2 = df.groupby("cluster_zona")["precio_m2"].median()
+    city_pm2 = df.groupby("ciudad")["precio_m2"].median()
+    global_pm2 = float(df["precio_m2"].median() or 0.0)
+
+    cluster_ratio = df.groupby("cluster_zona")["ratio_activas_vendidas_zona"].mean()
+    city_ratio = df.groupby("ciudad")["ratio_activas_vendidas_zona"].mean()
+    global_ratio = float(df["ratio_activas_vendidas_zona"].mean() or 0.0)
+
+    def _context_value(
+        row: pd.Series,
+        cluster_series: pd.Series,
+        city_series: pd.Series,
+        global_value: float,
+    ) -> float:
+        cluster_key = row.get("cluster_zona")
+        city_key = row.get("ciudad")
+
+        if pd.notna(cluster_key) and cluster_key in cluster_series.index:
+            value = cluster_series.loc[cluster_key]
+            if pd.notna(value):
+                return float(value)
+
+        if pd.notna(city_key) and city_key in city_series.index:
+            value = city_series.loc[city_key]
+            if pd.notna(value):
+                return float(value)
+
+        return float(global_value or 0.0)
+
+    df["precio_m2"] = df.apply(
+        lambda row: _context_value(row, cluster_pm2, city_pm2, global_pm2),
+        axis=1,
+    )
+    df["ratio_activas_vendidas_zona"] = df.apply(
+        lambda row: _context_value(row, cluster_ratio, city_ratio, global_ratio),
+        axis=1,
+    )
+    return df
+
+
 # ---------------------------------------------------------------------------
 # ModelBundle
 # ---------------------------------------------------------------------------
@@ -307,6 +366,7 @@ def train_bundle(
     # Preprocesar
     df = _fill_numeric(df, num_pub)   # num_pub es el superconjunto
     df = _fill_categorical(df)
+    df_no_pub = _apply_alquiler_no_pub_context(df) if tipo_transaccion == "Alquiler" else df
 
     # Encoder escalable
     encoder = _build_encoder(df)
@@ -314,7 +374,7 @@ def train_bundle(
 
     # Matrices de features
     X_num_pub = df[num_pub].astype(float).values
-    X_num_nop = df[num_no_pub].astype(float).values
+    X_num_nop = df_no_pub[num_no_pub].astype(float).values
 
     # Para el modelo de velocidad de venta, excluimos tiempo_en_mercado
     num_sp = [c for c in NUMERIC_FEATURES_SALE_PROB if c in num_pub]

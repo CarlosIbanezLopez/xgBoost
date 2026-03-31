@@ -60,6 +60,7 @@ def fetch_property_analytics(
             estado_propiedad,
             segmento,
             tipo_transaccion,
+            cluster_zona,
             latitude,
             longitude,
             ciudad,

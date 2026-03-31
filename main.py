@@ -281,9 +281,11 @@ def _build_X(
 
 
 def _has_pub_price(payload: PredictRequest) -> bool:
+    if payload.precio_publicacion not in (None, 0):
+        return True
     if payload.tipo_transaccion == "Alquiler":
         return payload.precio_alquiler_mes not in (None, 0)
-    return payload.precio_publicacion not in (None, 0)
+    return False
 
 
 def _has_terrain_pub_price(data: dict) -> bool:
