@@ -34,6 +34,7 @@ MODEL_DIR = BASE_DIR / "models"
 MODEL_DIR.mkdir(exist_ok=True)
 
 RANDOM_STATE = int(os.getenv("RANDOM_STATE", "42"))
+TERRAIN_SPECIAL_MIN_ROWS = int(os.getenv("TERRAIN_SPECIAL_MIN_ROWS", "100"))
 
 # ---------------------------------------------------------------------------
 # Combinaciones válidas: (tipo_transaccion, segmento) → (idx_con_pub, idx_sin_pub)
@@ -58,6 +59,15 @@ def model_paths(model_idx: int) -> dict[str, Path]:
         "regressor":  MODEL_DIR / f"xgb_regressor_m{model_idx}.joblib",
         "encoder":    MODEL_DIR / f"encoder_m{model_idx}.joblib",
         "classifier": MODEL_DIR / f"xgb_classifier_m{model_idx}.joblib",
+    }
+
+
+def terrain_model_paths(tipo_transaccion: str) -> dict[str, Path]:
+    slug = f"terreno_{tipo_transaccion.strip().lower()}"
+    return {
+        "regressor_pub":    MODEL_DIR / f"xgb_regressor_{slug}_pub.joblib",
+        "regressor_no_pub": MODEL_DIR / f"xgb_regressor_{slug}_no_pub.joblib",
+        "encoder":          MODEL_DIR / f"encoder_{slug}.joblib",
     }
 
 

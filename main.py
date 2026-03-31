@@ -7,7 +7,7 @@ from typing import Dict, Literal, Optional
 
 import numpy as np
 import pandas as pd
-from fastapi import Depends, FastAPI, HTTPException, status
+from fastapi import Depends, FastAPI, HTTPException
 from fastapi.security import APIKeyHeader
 from pydantic import BaseModel, Field
 
@@ -18,11 +18,12 @@ from db import (
     fetch_nearest_zone_cluster,
 )
 from ml_pipeline import (
-    CATEGORICAL_FEATURES,
-    NUMERIC_FEATURES_SALE_PROB,
     load_bundle,
+    load_terrain_bundle,
     save_all_bundles,
+    save_all_terrain_bundles,
     train_all_models,
+    train_all_terrain_models,
 )
 
 app = FastAPI(title="XGBoost Property Service", version="2.1.0")
@@ -131,6 +132,7 @@ async def require_train_key(api_key: str = Depends(api_key_header)):
 # ---------------------------------------------------------------------------
 
 _bundle_cache: Dict[tuple, dict] = {}
+_terrain_bundle_cache: Dict[str, dict] = {}
 
 
 def _get_bundle(tipo_transaccion: str, segmento: str) -> dict:
@@ -149,8 +151,16 @@ def _get_bundle(tipo_transaccion: str, segmento: str) -> dict:
     return _bundle_cache[key]
 
 
+def _get_terrain_bundle(tipo_transaccion: str) -> dict:
+    key = tipo_transaccion
+    if key not in _terrain_bundle_cache:
+        _terrain_bundle_cache[key] = load_terrain_bundle(tipo_transaccion)
+    return _terrain_bundle_cache[key]
+
+
 def _invalidate_cache() -> None:
     _bundle_cache.clear()
+    _terrain_bundle_cache.clear()
 
 
 # ---------------------------------------------------------------------------
@@ -170,6 +180,14 @@ def _enrich(data: dict) -> dict:
             if not data.get("pais"):
                 data["pais"] = str(nearest.get("pais") or "")
     return data
+
+
+def _normalize_tipo_propiedad(tipo_propiedad: Optional[str]) -> str:
+    return (tipo_propiedad or "").strip().lower()
+
+
+def _is_terrain_request(tipo_propiedad: Optional[str]) -> bool:
+    return _normalize_tipo_propiedad(tipo_propiedad) == "terreno"
 
 
 def _has_price_basis(data: dict) -> bool:
@@ -232,6 +250,7 @@ def _build_X(
     data: dict,
     numeric_features: list[str],
     encoder,
+    categorical_features: Optional[list[str]] = None,
 ) -> np.ndarray:
     """Construye el vector de features listo para predict."""
 
@@ -247,11 +266,15 @@ def _build_X(
 
     X_num = np.array([[_num(c) for c in numeric_features]])
     
+    categorical_features = categorical_features or []
+    if encoder is None or not categorical_features:
+        return X_num
+
     # Creamos un DataFrame para evitar el UserWarning de Scikit-Learn
     # "X does not have valid feature names, but OrdinalEncoder was fitted with feature names"
     X_cat_raw = pd.DataFrame(
-        [[str(data.get(c) or "Desconocido") for c in CATEGORICAL_FEATURES]],
-        columns=CATEGORICAL_FEATURES
+        [[str(data.get(c) or "Desconocido") for c in categorical_features]],
+        columns=categorical_features,
     )
     X_cat = encoder.transform(X_cat_raw)
     return np.hstack([X_num, X_cat])
@@ -261,6 +284,26 @@ def _has_pub_price(payload: PredictRequest) -> bool:
     if payload.tipo_transaccion == "Alquiler":
         return payload.precio_alquiler_mes not in (None, 0)
     return payload.precio_publicacion not in (None, 0)
+
+
+def _has_terrain_pub_price(data: dict) -> bool:
+    return float(data.get("precio_publicacion") or 0) > 0
+
+
+def _inverse_target_transform(value: float, target_transform: Optional[str]) -> float:
+    if target_transform == "log1p":
+        return float(max(np.expm1(value), 0.0))
+    return float(value)
+
+
+def _expected_pct_error(pred: float, price_bins: np.ndarray, pct_errors: np.ndarray) -> float:
+    if len(pct_errors) == 0:
+        return 0.0
+    bin_idx = max(0, min(
+        int(np.digitize(pred, price_bins, right=True) - 1),
+        len(pct_errors) - 1,
+    ))
+    return float(pct_errors[bin_idx])
 
 
 def _log_input(data: dict, tag: str) -> None:
@@ -275,9 +318,11 @@ def _log_input(data: dict, tag: str) -> None:
 
 @app.post("/train", response_model=TrainResponse, dependencies=[Depends(require_train_key)])
 def train_endpoint():
-    """Entrena los 4 bundles (8 regressors + 4 classifiers de precio + 4 de velocidad)."""
+    """Entrena los bundles generales y el regressor especializado de Terreno."""
     bundles = train_all_models()
     save_all_bundles(bundles)
+    terrain_bundles = train_all_terrain_models()
+    save_all_terrain_bundles(terrain_bundles)
     _invalidate_cache()
 
     results = [
@@ -292,6 +337,36 @@ def train_endpoint():
         }
         for b in bundles.values()
     ]
+    results.extend(
+        {
+            "tipo_transaccion": b.tipo_transaccion,
+            "segmento": "Terreno",
+            "mae_pub": round(b.reg_mae_pub, 2),
+            "mae_no_pub": round(b.reg_mae_no_pub, 2),
+            "sample_count": b.sample_count,
+        }
+        for b in terrain_bundles.values()
+    )
+    return TrainResponse(results=results)
+
+
+@app.post("/train/terrain", response_model=TrainResponse, dependencies=[Depends(require_train_key)])
+def train_terrain_endpoint():
+    """Entrena solo los regressors especializados para Terreno."""
+    bundles = train_all_terrain_models()
+    save_all_terrain_bundles(bundles)
+    _invalidate_cache()
+
+    results = [
+        {
+            "tipo_transaccion": b.tipo_transaccion,
+            "segmento": "Terreno",
+            "mae_pub": round(b.reg_mae_pub, 2),
+            "mae_no_pub": round(b.reg_mae_no_pub, 2),
+            "sample_count": b.sample_count,
+        }
+        for b in bundles.values()
+    ]
     return TrainResponse(results=results)
 
 
@@ -301,6 +376,85 @@ def predict_regression(payload: PredictRequest):
     Predice el precio de venta o alquiler.
     Usa automáticamente el modelo con/sin precio_publicacion según lo que venga.
     """
+    data = _enrich(payload.dict())
+    terrain_bundle = None
+    if _is_terrain_request(data.get("tipo_propiedad")):
+        try:
+            terrain_bundle = _get_terrain_bundle(payload.tipo_transaccion)
+        except FileNotFoundError:
+            terrain_bundle = None
+
+    if terrain_bundle is not None:
+        use_no_pub = not _has_terrain_pub_price(data)
+        _log_input(data, "regression-terreno")
+
+        numeric_features = (
+            terrain_bundle["numeric_features_no_pub"] if use_no_pub
+            else terrain_bundle["numeric_features_pub"]
+        )
+        X_row = _build_X(
+            data,
+            numeric_features,
+            terrain_bundle["encoder"],
+            terrain_bundle.get("categorical_features"),
+        )
+
+        regressor = (
+            terrain_bundle["regressor_no_pub"] if use_no_pub
+            else terrain_bundle["regressor_pub"]
+        )
+        pred = _inverse_target_transform(
+            float(regressor.predict(X_row)[0]),
+            terrain_bundle.get("target_transform"),
+        )
+
+        reg_mae = (
+            terrain_bundle["reg_mae_no_pub"] if use_no_pub
+            else terrain_bundle["reg_mae_pub"]
+        )
+        price_bins = (
+            terrain_bundle["price_bins_no_pub"] if use_no_pub
+            else terrain_bundle["price_bins_pub"]
+        )
+        pct_errors = (
+            terrain_bundle["mean_abs_pct_error_no_pub"] if use_no_pub
+            else terrain_bundle["mean_abs_pct_error_pub"]
+        )
+        expected_pct = _expected_pct_error(pred, price_bins, pct_errors)
+        model_tag = (
+            f"terrain_{payload.tipo_transaccion}_no_pub"
+            if use_no_pub
+            else f"terrain_{payload.tipo_transaccion}_pub"
+        )
+
+        comparables = fetch_comparable_listings(
+            latitude=payload.latitude,
+            longitude=payload.longitude,
+            ciudad=data.get("ciudad"),
+            pais=data.get("pais"),
+            tipo_propiedad=data.get("tipo_propiedad"),
+            segmento=None,
+            tipo_transaccion=payload.tipo_transaccion,
+            m2_construidos=0,
+            m2_terreno=payload.m2_terreno,
+            dormitorios=0,
+            banos=0,
+            precio_m2_referencia=0.0,
+            limit=20,
+        )
+
+        return RegressionPrediction(
+            predicted_price=pred,
+            expected_abs_error=float(reg_mae),
+            expected_pct_error=expected_pct,
+            interval_approx={
+                "lower": max(pred * (1.0 - expected_pct), 0.0),
+                "upper": pred * (1.0 + expected_pct),
+            },
+            model_used=model_tag,
+            comparables=comparables,
+        )
+
     try:
         idx_pub, idx_no_pub = get_model_indices(payload.tipo_transaccion, payload.segmento)
     except ValueError as e:
@@ -309,7 +463,6 @@ def predict_regression(payload: PredictRequest):
     bundle = _get_bundle(payload.tipo_transaccion, payload.segmento)
     use_no_pub = not _has_pub_price(payload)
 
-    data = _enrich(payload.dict())
     data = _apply_market_fallbacks(data, use_no_pub=use_no_pub)
     _log_input(data, "regression")
 
@@ -317,20 +470,20 @@ def predict_regression(payload: PredictRequest):
         bundle["numeric_features_no_pub"] if use_no_pub
         else bundle["numeric_features_pub"]
     )
-    X_row = _build_X(data, numeric_features, bundle["encoder"])
+    X_row = _build_X(
+        data,
+        numeric_features,
+        bundle["encoder"],
+        bundle.get("categorical_features"),
+    )
 
     regressor = bundle["regressor_no_pub"] if use_no_pub else bundle["regressor_pub"]
     pred = float(regressor.predict(X_row)[0])
 
-    reg_mae    = bundle["reg_mae_no_pub"]      if use_no_pub else bundle["reg_mae_pub"]
-    price_bins = bundle["price_bins_no_pub"]   if use_no_pub else bundle["price_bins_pub"]
+    reg_mae = bundle["reg_mae_no_pub"] if use_no_pub else bundle["reg_mae_pub"]
+    price_bins = bundle["price_bins_no_pub"] if use_no_pub else bundle["price_bins_pub"]
     pct_errors = bundle["mean_abs_pct_error_no_pub"] if use_no_pub else bundle["mean_abs_pct_error_pub"]
-
-    bin_idx = max(0, min(
-        int(np.digitize(pred, price_bins, right=True) - 1),
-        len(pct_errors) - 1,
-    ))
-    expected_pct = float(pct_errors[bin_idx])
+    expected_pct = _expected_pct_error(pred, price_bins, pct_errors)
     model_tag = (
         f"m{idx_no_pub}_{payload.tipo_transaccion}_{payload.segmento}_no_pub"
         if use_no_pub
@@ -378,7 +531,12 @@ def predict_classification(payload: PredictRequest):
     data   = _enrich(payload.dict())
     _log_input(data, "classification")
 
-    X_row = _build_X(data, bundle["numeric_features_pub"], bundle["encoder"])
+    X_row = _build_X(
+        data,
+        bundle["numeric_features_pub"],
+        bundle["encoder"],
+        bundle.get("categorical_features"),
+    )
     probs = bundle["classifier"].predict_proba(X_row)[0]
 
     idx_to_label = {0: "bajo", 1: "medio", 2: "alto"}
@@ -416,7 +574,12 @@ def predict_sale_probability(payload: PredictRequest):
 
     # Features del modelo de velocidad (sin tiempo_en_mercado)
     num_sp = bundle["numeric_features_sale_prob"]
-    X_row  = _build_X(data, num_sp, bundle["encoder"])
+    X_row = _build_X(
+        data,
+        num_sp,
+        bundle["encoder"],
+        bundle.get("categorical_features"),
+    )
 
     probs = bundle["sale_prob_classifier"].predict_proba(X_row)[0]
     # probs[0]=≤30d  probs[1]=31-60d  probs[2]=61-90d  probs[3]=>90d
@@ -452,10 +615,21 @@ def list_models():
                 "loaded_in_cache":  (tt, seg) in _bundle_cache,
             }
             for (tt, seg), idxs in VALID_COMBINATIONS.items()
-        ]
+        ],
+        "terrain_regressors": [
+            {
+                "tipo_transaccion": tt,
+                "loaded_in_cache": tt in _terrain_bundle_cache,
+            }
+            for tt in ("Venta", "Alquiler")
+        ],
     }
 
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "models_cached": len(_bundle_cache)}
+    return {
+        "status": "ok",
+        "models_cached": len(_bundle_cache),
+        "terrain_models_cached": len(_terrain_bundle_cache),
+    }

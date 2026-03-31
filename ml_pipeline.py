@@ -11,7 +11,13 @@ from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import OrdinalEncoder
 from xgboost import XGBClassifier, XGBRegressor
 
-from config import RANDOM_STATE, VALID_COMBINATIONS, model_paths
+from config import (
+    RANDOM_STATE,
+    TERRAIN_SPECIAL_MIN_ROWS,
+    VALID_COMBINATIONS,
+    model_paths,
+    terrain_model_paths,
+)
 from db import fetch_property_analytics
 
 
@@ -99,6 +105,23 @@ NUMERIC_FEATURES_SALE_PROB: List[str] = [
     "anio_publicacion",
 ]
 
+TERRAIN_NUMERIC_FEATURES_PUB: List[str] = [
+    "latitude",
+    "longitude",
+    "m2_terreno",
+    "precio_publicacion",
+]
+
+TERRAIN_NUMERIC_FEATURES_NO_PUB: List[str] = [
+    "latitude",
+    "longitude",
+    "m2_terreno",
+]
+
+TERRAIN_CATEGORICAL_FEATURES: List[str] = [
+    "tipo_propiedad",
+]
+
 _NUMERIC_MAP: dict[tuple[str, str], tuple[list[str], list[str]]] = {
     ("Venta",    "Residencial"): (NUMERIC_FEATURES_VENTA,    NUMERIC_FEATURES_VENTA_NO_PUB),
     ("Venta",    "Comercial"):   (NUMERIC_FEATURES_VENTA,    NUMERIC_FEATURES_VENTA_NO_PUB),
@@ -151,10 +174,14 @@ def _fill_numeric(df: pd.DataFrame, numeric_features: List[str]) -> pd.DataFrame
     return df
 
 
-def _fill_categorical(df: pd.DataFrame) -> pd.DataFrame:
+def _fill_categorical(
+    df: pd.DataFrame,
+    categorical_features: List[str] | None = None,
+) -> pd.DataFrame:
     """Rellena categóricas con 'Desconocido'."""
     df = df.copy()
-    for col in CATEGORICAL_FEATURES:
+    categorical_features = categorical_features or CATEGORICAL_FEATURES
+    for col in categorical_features:
         if col in df.columns:
             df[col] = df[col].fillna("Desconocido").astype(str)
         else:
@@ -162,7 +189,10 @@ def _fill_categorical(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def _build_encoder(df: pd.DataFrame) -> OrdinalEncoder:
+def _build_encoder(
+    df: pd.DataFrame,
+    categorical_features: List[str] | None = None,
+) -> OrdinalEncoder:
     """
     Ajusta el OrdinalEncoder sobre los valores presentes en los datos.
     Escalable: si la BD agrega nuevas ciudades/tipos, el encoder las aprende
@@ -170,7 +200,8 @@ def _build_encoder(df: pd.DataFrame) -> OrdinalEncoder:
     handle_unknown='use_encoded_value' + unknown_value=-1 evita errores
     en inferencia ante valores no vistos en entrenamiento.
     """
-    X_cat = df[CATEGORICAL_FEATURES].fillna("Desconocido").astype(str)
+    categorical_features = categorical_features or CATEGORICAL_FEATURES
+    X_cat = df[categorical_features].fillna("Desconocido").astype(str)
     encoder = OrdinalEncoder(
         handle_unknown="use_encoded_value",
         unknown_value=-1,
@@ -219,6 +250,29 @@ class ModelBundle:
     clf_accuracy: float = 0.0
     clf_f1_weighted: float = 0.0
     sale_prob_accuracy: float = 0.0
+
+    price_bins_pub: np.ndarray = field(repr=False, default_factory=lambda: np.array([]))
+    mean_abs_pct_error_pub: np.ndarray = field(repr=False, default_factory=lambda: np.array([]))
+    price_bins_no_pub: np.ndarray = field(repr=False, default_factory=lambda: np.array([]))
+    mean_abs_pct_error_no_pub: np.ndarray = field(repr=False, default_factory=lambda: np.array([]))
+
+
+@dataclass
+class TerrainModelBundle:
+    tipo_transaccion: str
+
+    regressor_pub: XGBRegressor = field(repr=False)
+    regressor_no_pub: XGBRegressor = field(repr=False)
+    encoder: OrdinalEncoder = field(repr=False)
+
+    numeric_features_pub: List[str] = field(repr=False)
+    numeric_features_no_pub: List[str] = field(repr=False)
+    categorical_features: List[str] = field(repr=False)
+
+    reg_mae_pub: float = 0.0
+    reg_mae_no_pub: float = 0.0
+    sample_count: int = 0
+    target_transform: str = "log1p"
 
     price_bins_pub: np.ndarray = field(repr=False, default_factory=lambda: np.array([]))
     mean_abs_pct_error_pub: np.ndarray = field(repr=False, default_factory=lambda: np.array([]))
@@ -380,6 +434,114 @@ def train_all_models(test_size: float = 0.2) -> Dict[tuple, ModelBundle]:
 
 
 # ---------------------------------------------------------------------------
+# Terreno especializado
+# ---------------------------------------------------------------------------
+
+def train_terrain_bundle(
+    tipo_transaccion: str,
+    test_size: float = 0.2,
+    min_rows: int = TERRAIN_SPECIAL_MIN_ROWS,
+) -> TerrainModelBundle:
+    target_col = _target_col(tipo_transaccion)
+
+    print(f"\n[train][terrain] {tipo_transaccion} - cargando datos...", flush=True)
+    df_raw = fetch_property_analytics(tipo_transaccion=tipo_transaccion)
+    df = df_raw[
+        df_raw["tipo_propiedad"].fillna("").str.strip().str.lower().eq("terreno")
+        & df_raw[target_col].notna()
+        & (df_raw[target_col] > 0)
+    ].copy()
+
+    if len(df) < min_rows:
+        raise ValueError(
+            f"Datos insuficientes para Terreno/{tipo_transaccion}: {len(df)} filas."
+        )
+    print(f"[train][terrain] {tipo_transaccion} - {len(df)} filas validas.", flush=True)
+
+    df = _fill_numeric(df, TERRAIN_NUMERIC_FEATURES_PUB)
+    df = _fill_categorical(df, TERRAIN_CATEGORICAL_FEATURES)
+
+    encoder = _build_encoder(df, TERRAIN_CATEGORICAL_FEATURES)
+    X_cat_enc = encoder.transform(df[TERRAIN_CATEGORICAL_FEATURES].astype(str))
+
+    X_num_pub = df[TERRAIN_NUMERIC_FEATURES_PUB].astype(float).values
+    X_num_nop = df[TERRAIN_NUMERIC_FEATURES_NO_PUB].astype(float).values
+    X_full_pub = np.hstack([X_num_pub, X_cat_enc])
+    X_full_nop = np.hstack([X_num_nop, X_cat_enc])
+
+    y_raw = df[target_col].astype(float).values
+    y_log = np.log1p(y_raw)
+
+    (
+        X_tr_pub, X_te_pub,
+        X_tr_nop, X_te_nop,
+        y_tr_log, _y_te_log,
+        _y_tr_raw, y_te_raw,
+    ) = train_test_split(
+        X_full_pub, X_full_nop,
+        y_log, y_raw,
+        test_size=test_size,
+        random_state=RANDOM_STATE,
+    )
+
+    xgb_reg_params = dict(
+        n_estimators=400, learning_rate=0.05, max_depth=6,
+        subsample=0.8, colsample_bytree=0.8,
+        objective="reg:squarederror",
+        random_state=RANDOM_STATE, n_jobs=-1,
+    )
+
+    reg_pub = XGBRegressor(**xgb_reg_params)
+    reg_pub.fit(X_tr_pub, y_tr_log)
+    y_pred_pub = np.maximum(np.expm1(reg_pub.predict(X_te_pub)), 0.0)
+    mae_pub = float(mean_absolute_error(y_te_raw, y_pred_pub))
+    bins_pub, pct_pub = _compute_pct_bins(y_te_raw, y_pred_pub)
+
+    reg_nop = XGBRegressor(**xgb_reg_params)
+    reg_nop.fit(X_tr_nop, y_tr_log)
+    y_pred_nop = np.maximum(np.expm1(reg_nop.predict(X_te_nop)), 0.0)
+    mae_nop = float(mean_absolute_error(y_te_raw, y_pred_nop))
+    bins_nop, pct_nop = _compute_pct_bins(y_te_raw, y_pred_nop)
+
+    print(
+        f"[train][terrain] {tipo_transaccion} done - "
+        f"MAE_pub={mae_pub:.2f}  MAE_no_pub={mae_nop:.2f}",
+        flush=True,
+    )
+
+    return TerrainModelBundle(
+        tipo_transaccion=tipo_transaccion,
+        regressor_pub=reg_pub,
+        regressor_no_pub=reg_nop,
+        encoder=encoder,
+        numeric_features_pub=TERRAIN_NUMERIC_FEATURES_PUB,
+        numeric_features_no_pub=TERRAIN_NUMERIC_FEATURES_NO_PUB,
+        categorical_features=TERRAIN_CATEGORICAL_FEATURES,
+        reg_mae_pub=mae_pub,
+        reg_mae_no_pub=mae_nop,
+        sample_count=len(df),
+        target_transform="log1p",
+        price_bins_pub=bins_pub,
+        mean_abs_pct_error_pub=pct_pub,
+        price_bins_no_pub=bins_nop,
+        mean_abs_pct_error_no_pub=pct_nop,
+    )
+
+
+def train_all_terrain_models(
+    test_size: float = 0.2,
+    min_rows: int = TERRAIN_SPECIAL_MIN_ROWS,
+) -> Dict[str, TerrainModelBundle]:
+    bundles: Dict[str, TerrainModelBundle] = {}
+    for tt in ("Venta", "Alquiler"):
+        try:
+            bundles[tt] = train_terrain_bundle(tt, test_size=test_size, min_rows=min_rows)
+        except ValueError as e:
+            print(f"[train][terrain] WARN: {e} - saltando.", flush=True)
+    return bundles
+
+
+# ---------------------------------------------------------------------------
 # Persistencia
 # ---------------------------------------------------------------------------
 
@@ -455,6 +617,59 @@ def save_all_bundles(bundles: Dict[tuple, ModelBundle]) -> None:
         save_bundle(b)
 
 
+def save_terrain_bundle(bundle: TerrainModelBundle) -> None:
+    paths = terrain_model_paths(bundle.tipo_transaccion)
+
+    enc_payload = {
+        "encoder": bundle.encoder,
+        "categorical_features": bundle.categorical_features,
+        "known_categories": {
+            feat: list(cats)
+            for feat, cats in zip(bundle.categorical_features, bundle.encoder.categories_)
+        },
+    }
+    joblib.dump(enc_payload, paths["encoder"])
+
+    pub_payload = {
+        "regressor": bundle.regressor_pub,
+        "numeric_features": bundle.numeric_features_pub,
+        "categorical_features": bundle.categorical_features,
+        "reg_mae": bundle.reg_mae_pub,
+        "price_bins": bundle.price_bins_pub,
+        "mean_abs_pct_error_by_bin": bundle.mean_abs_pct_error_pub,
+        "tipo_transaccion": bundle.tipo_transaccion,
+        "tipo_propiedad": "Terreno",
+        "target_transform": bundle.target_transform,
+        "sample_count": bundle.sample_count,
+    }
+    joblib.dump(pub_payload, paths["regressor_pub"])
+
+    nop_payload = {
+        "regressor": bundle.regressor_no_pub,
+        "numeric_features": bundle.numeric_features_no_pub,
+        "categorical_features": bundle.categorical_features,
+        "reg_mae": bundle.reg_mae_no_pub,
+        "price_bins": bundle.price_bins_no_pub,
+        "mean_abs_pct_error_by_bin": bundle.mean_abs_pct_error_no_pub,
+        "tipo_transaccion": bundle.tipo_transaccion,
+        "tipo_propiedad": "Terreno",
+        "target_transform": bundle.target_transform,
+        "sample_count": bundle.sample_count,
+    }
+    joblib.dump(nop_payload, paths["regressor_no_pub"])
+
+    print(
+        f"[save][terrain] {bundle.tipo_transaccion} guardado "
+        f"({paths['regressor_pub'].name}, {paths['regressor_no_pub'].name}).",
+        flush=True,
+    )
+
+
+def save_all_terrain_bundles(bundles: Dict[str, TerrainModelBundle]) -> None:
+    for b in bundles.values():
+        save_terrain_bundle(b)
+
+
 def load_bundle(tipo_transaccion: str, segmento: str) -> dict:
     from config import get_model_indices
 
@@ -466,6 +681,7 @@ def load_bundle(tipo_transaccion: str, segmento: str) -> dict:
     reg_nop_b = joblib.load(paths_nop["regressor"])
     clf_b     = joblib.load(paths_pub["classifier"])
     enc_b     = joblib.load(paths_pub["encoder"])
+    categorical_features = enc_b.get("categorical_features", CATEGORICAL_FEATURES)
 
     return {
         "regressor_pub":              reg_pub_b["regressor"],
@@ -477,7 +693,7 @@ def load_bundle(tipo_transaccion: str, segmento: str) -> dict:
         "numeric_features_pub":       reg_pub_b["numeric_features"],
         "numeric_features_no_pub":    reg_nop_b["numeric_features"],
         "numeric_features_sale_prob": clf_b.get("numeric_features_sale_prob", NUMERIC_FEATURES_SALE_PROB),
-        "categorical_features":       CATEGORICAL_FEATURES,
+        "categorical_features":       categorical_features,
         "reg_mae_pub":                reg_pub_b["reg_mae"],
         "reg_mae_no_pub":             reg_nop_b["reg_mae"],
         "price_bins_pub":             np.array(reg_pub_b["price_bins"]),
@@ -490,6 +706,33 @@ def load_bundle(tipo_transaccion: str, segmento: str) -> dict:
     }
 
 
+def load_terrain_bundle(tipo_transaccion: str) -> dict:
+    paths = terrain_model_paths(tipo_transaccion)
+
+    reg_pub_b = joblib.load(paths["regressor_pub"])
+    reg_nop_b = joblib.load(paths["regressor_no_pub"])
+    enc_b     = joblib.load(paths["encoder"])
+    categorical_features = enc_b.get("categorical_features", TERRAIN_CATEGORICAL_FEATURES)
+
+    return {
+        "regressor_pub":             reg_pub_b["regressor"],
+        "regressor_no_pub":          reg_nop_b["regressor"],
+        "encoder":                   enc_b["encoder"],
+        "known_categories":          enc_b.get("known_categories", {}),
+        "numeric_features_pub":      reg_pub_b["numeric_features"],
+        "numeric_features_no_pub":   reg_nop_b["numeric_features"],
+        "categorical_features":      categorical_features,
+        "reg_mae_pub":               reg_pub_b["reg_mae"],
+        "reg_mae_no_pub":            reg_nop_b["reg_mae"],
+        "price_bins_pub":            np.array(reg_pub_b["price_bins"]),
+        "mean_abs_pct_error_pub":    np.array(reg_pub_b["mean_abs_pct_error_by_bin"]),
+        "price_bins_no_pub":         np.array(reg_nop_b["price_bins"]),
+        "mean_abs_pct_error_no_pub": np.array(reg_nop_b["mean_abs_pct_error_by_bin"]),
+        "target_transform":          reg_pub_b.get("target_transform", "log1p"),
+        "sample_count":              int(reg_pub_b.get("sample_count", 0)),
+    }
+
+
 # ---------------------------------------------------------------------------
 # Entrypoint CLI
 # ---------------------------------------------------------------------------
@@ -497,6 +740,8 @@ def load_bundle(tipo_transaccion: str, segmento: str) -> dict:
 if __name__ == "__main__":
     bundles = train_all_models()
     save_all_bundles(bundles)
+    terrain_bundles = train_all_terrain_models()
+    save_all_terrain_bundles(terrain_bundles)
 
     print("\n=== Resumen ===")
     for (tt, seg), b in bundles.items():
@@ -505,4 +750,10 @@ if __name__ == "__main__":
             f"MAE_pub={b.reg_mae_pub:.2f}  MAE_no_pub={b.reg_mae_no_pub:.2f}  "
             f"clf_precio_acc={b.clf_accuracy:.3f}  f1={b.clf_f1_weighted:.3f}  "
             f"clf_venta_acc={b.sale_prob_accuracy:.3f}"
+        )
+    for tt, b in terrain_bundles.items():
+        print(
+            f"  Terreno/{tt}: "
+            f"MAE_pub={b.reg_mae_pub:.2f}  MAE_no_pub={b.reg_mae_no_pub:.2f}  "
+            f"rows={b.sample_count}"
         )
