@@ -127,6 +127,7 @@ TERRAIN_NUMERIC_FEATURES_NO_PUB: List[str] = [
 
 TERRAIN_CATEGORICAL_FEATURES: List[str] = [
     "tipo_propiedad",
+    # "estado_propiedad",
 ]
 
 _NUMERIC_MAP: dict[tuple[str, str], tuple[list[str], list[str]]] = {
