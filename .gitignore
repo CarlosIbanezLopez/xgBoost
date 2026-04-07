@@ -1,5 +1,25 @@
 # Ignore trained model files and folders
 models/
+*.joblib
 
 # Environment variables
 .env
+
+# Python cache and bytecode
+__pycache__/
+*.py[cod]
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# Editor/IDE dirs
+.vscode/
+.idea/
+
+# OS files
+Thumbs.db
+ehthumbs.db
+/.DS_Store
+
