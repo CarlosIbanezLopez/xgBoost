@@ -1,0 +1,5 @@
+# Ignore trained model files and folders
+models/
+
+# Environment variables
+.env

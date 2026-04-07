@@ -256,7 +256,7 @@ def _build_X(
     """Construye el vector de features listo para predict."""
 
     # Calcular precio_m2 si falta
-    if data.get("precio_m2") in (None, 0):
+    if "precio_m2" in numeric_features and data.get("precio_m2") in (None, 0):
         area = data.get("m2_construidos") or data.get("m2_terreno") or 0
         pub  = data.get("precio_publicacion") or 0
         data["precio_m2"] = float(pub) / float(area) if area > 0 and pub > 0 else 0.0

@@ -46,6 +46,17 @@ NUMERIC_FEATURES_VENTA: List[str] = [
     # "anio_publicacion",
 ]
 
+NUMERIC_FEATURES_VENTA_PUB_REG: List[str] = [
+    "latitude",
+    "longitude",
+    "m2_construidos",
+    "m2_terreno",
+    "dormitorios",
+    "banos",
+    "antiguedad",
+    "precio_publicacion",
+]
+
 NUMERIC_FEATURES_VENTA_NO_PUB: List[str] = [
     c for c in NUMERIC_FEATURES_VENTA if c != "precio_publicacion"
 ]
@@ -368,7 +379,7 @@ def train_bundle(
     reg_num_pub = (
         NUMERIC_FEATURES_ALQUILER_PUB_REG
         if tipo_transaccion == "Alquiler"
-        else num_pub
+        else NUMERIC_FEATURES_VENTA_PUB_REG
     )
     target_col = _target_col(tipo_transaccion)
 
