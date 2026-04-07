@@ -331,6 +331,7 @@ def fetch_location_market_stats(
     longitude: float,
     tipo_transaccion: str,
     segmento: str,
+    tipo_propiedad: str | None = None,
     ciudad: str | None = None,
     pais: str | None = None,
     min_cluster_samples: int = 8,
@@ -351,9 +352,16 @@ def fetch_location_market_stats(
         return None
 
     target_col = "precio_alquiler_mes" if tipo_transaccion == "Alquiler" else "precio_venta"
+    normalized_tipo = (tipo_propiedad or "").strip().lower()
 
-    def _query_stats(*, use_cluster: bool) -> dict | None:
+    def _query_stats(*, use_cluster: bool, tipo_scope: str) -> dict | None:
         cluster_clause = "AND cluster_zona = :cluster_zona" if use_cluster else ""
+        tipo_clause = ""
+        if tipo_scope == "exact" and normalized_tipo:
+            tipo_clause = "AND LOWER(TRIM(tipo_propiedad)) = :tipo_propiedad_norm"
+        elif tipo_scope == "non_terrain":
+            tipo_clause = "AND LOWER(TRIM(COALESCE(tipo_propiedad, ''))) <> 'terreno'"
+
         query = text(
             f"""
             SELECT
@@ -366,6 +374,7 @@ def fetch_location_market_stats(
               AND ciudad = :ciudad
               AND (:pais IS NULL OR pais = :pais)
               {cluster_clause}
+              {tipo_clause}
               AND precio_m2 IS NOT NULL
               AND precio_m2 > 0
               AND {target_col} IS NOT NULL
@@ -378,6 +387,8 @@ def fetch_location_market_stats(
             "ciudad": resolved_city,
             "pais": resolved_country,
         }
+        if tipo_scope == "exact" and normalized_tipo:
+            params["tipo_propiedad_norm"] = normalized_tipo
         if use_cluster:
             params["cluster_zona"] = cluster_id
 
@@ -394,6 +405,8 @@ def fetch_location_market_stats(
 
         return {
             "scope": "cluster" if use_cluster else "city",
+            "tipo_scope": tipo_scope,
+            "tipo_propiedad": normalized_tipo or None,
             "ciudad": resolved_city,
             "pais": resolved_country,
             "cluster_zona": cluster_id if use_cluster else None,
@@ -402,19 +415,32 @@ def fetch_location_market_stats(
             "ratio_activas_vendidas_zona": float(row["ratio_activas_vendidas_zona_promedio"] or 0.0),
         }
 
-    city_stats = _query_stats(use_cluster=False)
+    search_scopes: list[str] = []
+    if normalized_tipo:
+        search_scopes.append("exact")
+    if normalized_tipo != "terreno":
+        search_scopes.append("non_terrain")
+    search_scopes.append("all")
 
-    if cluster_id is not None:
-        cluster_stats = _query_stats(use_cluster=True)
-        if cluster_stats and cluster_stats["comparable_count"] >= min_cluster_samples:
-            if city_stats and city_stats.get("precio_m2_mediana"):
-                cluster_pm2 = float(cluster_stats["precio_m2_mediana"])
-                city_pm2 = float(city_stats["precio_m2_mediana"])
-                # Suavizamos extremos del cluster sin perder la señal local.
-                cluster_stats["precio_m2_mediana"] = math.sqrt(cluster_pm2 * city_pm2)
-            return cluster_stats
+    seen_scopes: set[str] = set()
+    for tipo_scope in search_scopes:
+        if tipo_scope in seen_scopes:
+            continue
+        seen_scopes.add(tipo_scope)
 
-    if city_stats:
-        return city_stats
+        city_stats = _query_stats(use_cluster=False, tipo_scope=tipo_scope)
+
+        if cluster_id is not None:
+            cluster_stats = _query_stats(use_cluster=True, tipo_scope=tipo_scope)
+            if cluster_stats and cluster_stats["comparable_count"] >= min_cluster_samples:
+                if city_stats and city_stats.get("precio_m2_mediana"):
+                    cluster_pm2 = float(cluster_stats["precio_m2_mediana"])
+                    city_pm2 = float(city_stats["precio_m2_mediana"])
+                    # Suavizamos extremos del cluster sin perder la señal local.
+                    cluster_stats["precio_m2_mediana"] = math.sqrt(cluster_pm2 * city_pm2)
+                return cluster_stats
+
+        if city_stats:
+            return city_stats
 
     return None

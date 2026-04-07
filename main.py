@@ -222,6 +222,7 @@ def _apply_market_fallbacks(data: dict, *, use_no_pub: bool) -> dict:
         longitude=float(data["longitude"]),
         tipo_transaccion=str(data["tipo_transaccion"]),
         segmento=str(data["segmento"]),
+        tipo_propiedad=data.get("tipo_propiedad"),
         ciudad=data.get("ciudad"),
         pais=data.get("pais"),
     )
@@ -535,7 +536,7 @@ def predict_classification(payload: PredictRequest):
 
     X_row = _build_X(
         data,
-        bundle["numeric_features_pub"],
+        bundle.get("numeric_features_classifier_pub", bundle["numeric_features_pub"]),
         bundle["encoder"],
         bundle.get("categorical_features"),
     )

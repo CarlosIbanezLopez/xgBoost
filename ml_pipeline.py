@@ -34,16 +34,16 @@ NUMERIC_FEATURES_VENTA: List[str] = [
     "m2_terreno",
     "dormitorios",
     "banos",
-    "estacionamientos",
+    # "estacionamientos",
     "antiguedad",
     "precio_publicacion",
     "precio_m2",
-    "tiempo_en_mercado",
-    "numero_reducciones",
-    "diferencia_vs_promedio_zona",
-    "ratio_activas_vendidas_zona",
-    "mes_publicacion",
-    "anio_publicacion",
+    # "tiempo_en_mercado",
+    # "numero_reducciones",
+    # "diferencia_vs_promedio_zona",
+    # "ratio_activas_vendidas_zona",
+    # "mes_publicacion",
+    # "anio_publicacion",
 ]
 
 NUMERIC_FEATURES_VENTA_NO_PUB: List[str] = [
@@ -67,6 +67,19 @@ NUMERIC_FEATURES_ALQUILER: List[str] = [
     "ratio_activas_vendidas_zona",
     "mes_publicacion",
     "anio_publicacion",
+]
+
+NUMERIC_FEATURES_ALQUILER_PUB_REG: List[str] = [
+    "latitude",
+    "longitude",
+    "m2_construidos",
+    "m2_terreno",
+    "dormitorios",
+    "banos",
+    "estacionamientos",
+    "antiguedad",
+    "precio_publicacion",
+    "precio_m2",
 ]
 
 NUMERIC_FEATURES_ALQUILER_NO_PUB: List[str] = [
@@ -303,6 +316,7 @@ class ModelBundle:
 
     numeric_features_pub: List[str] = field(repr=False)
     numeric_features_no_pub: List[str] = field(repr=False)
+    numeric_features_classifier_pub: List[str] = field(repr=False)
     numeric_features_sale_prob: List[str] = field(repr=False)
 
     reg_mae_pub: float = 0.0
@@ -351,6 +365,11 @@ def train_bundle(
 ) -> ModelBundle:
     idx_pub, idx_no_pub = VALID_COMBINATIONS[(tipo_transaccion, segmento)]
     num_pub, num_no_pub = _NUMERIC_MAP[(tipo_transaccion, segmento)]
+    reg_num_pub = (
+        NUMERIC_FEATURES_ALQUILER_PUB_REG
+        if tipo_transaccion == "Alquiler"
+        else num_pub
+    )
     target_col = _target_col(tipo_transaccion)
 
     print(f"\n[train] {tipo_transaccion}/{segmento} — cargando datos...", flush=True)
@@ -374,14 +393,16 @@ def train_bundle(
     X_cat_enc = encoder.transform(df[CATEGORICAL_FEATURES].astype(str))
 
     # Matrices de features
-    X_num_pub = df[num_pub].astype(float).values
+    X_num_pub_reg = df[reg_num_pub].astype(float).values
+    X_num_pub_clf = df[num_pub].astype(float).values
     X_num_nop = df_no_pub[num_no_pub].astype(float).values
 
     # Para el modelo de velocidad de venta, excluimos tiempo_en_mercado
     num_sp = [c for c in NUMERIC_FEATURES_SALE_PROB if c in num_pub]
     X_num_sp  = df[num_sp].astype(float).values
 
-    X_full_pub = np.hstack([X_num_pub, X_cat_enc])
+    X_full_pub_reg = np.hstack([X_num_pub_reg, X_cat_enc])
+    X_full_pub_clf = np.hstack([X_num_pub_clf, X_cat_enc])
     X_full_nop = np.hstack([X_num_nop, X_cat_enc])
     X_full_sp  = np.hstack([X_num_sp,  X_cat_enc])
 
@@ -397,14 +418,15 @@ def train_bundle(
 
     # Split único para consistencia
     (
-        X_tr_pub, X_te_pub,
+        X_tr_pub_reg, X_te_pub_reg,
+        X_tr_pub_clf, X_te_pub_clf,
         X_tr_nop, X_te_nop,
         X_tr_sp,  X_te_sp,
         y_reg_tr, y_reg_te,
         y_clf_tr, y_clf_te,
         y_sale_tr, y_sale_te,
     ) = train_test_split(
-        X_full_pub, X_full_nop, X_full_sp,
+        X_full_pub_reg, X_full_pub_clf, X_full_nop, X_full_sp,
         y_reg, y_clf, y_sale,
         test_size=test_size,
         random_state=RANDOM_STATE,
@@ -419,8 +441,8 @@ def train_bundle(
 
     # Regressor con pub
     reg_pub = XGBRegressor(**xgb_reg_params)
-    reg_pub.fit(X_tr_pub, y_reg_tr)
-    y_pred_pub = reg_pub.predict(X_te_pub)
+    reg_pub.fit(X_tr_pub_reg, y_reg_tr)
+    y_pred_pub = reg_pub.predict(X_te_pub_reg)
     mae_pub = float(mean_absolute_error(y_reg_te, y_pred_pub))
     bins_pub, pct_pub = _compute_pct_bins(y_reg_te, y_pred_pub)
 
@@ -438,9 +460,9 @@ def train_bundle(
         objective="multi:softprob", num_class=3,
         random_state=RANDOM_STATE, n_jobs=-1,
     )
-    clf.fit(X_tr_pub, y_clf_tr)
-    clf_acc = float(accuracy_score(y_clf_te, clf.predict(X_te_pub)))
-    clf_f1  = float(f1_score(y_clf_te, clf.predict(X_te_pub), average="weighted"))
+    clf.fit(X_tr_pub_clf, y_clf_tr)
+    clf_acc = float(accuracy_score(y_clf_te, clf.predict(X_te_pub_clf)))
+    clf_f1  = float(f1_score(y_clf_te, clf.predict(X_te_pub_clf), average="weighted"))
 
     # Classifier velocidad de venta
     sale_clf = XGBClassifier(
@@ -469,8 +491,9 @@ def train_bundle(
         classifier=clf,
         sale_prob_classifier=sale_clf,
         encoder=encoder,
-        numeric_features_pub=num_pub,
+        numeric_features_pub=reg_num_pub,
         numeric_features_no_pub=num_no_pub,
+        numeric_features_classifier_pub=num_pub,
         numeric_features_sale_prob=num_sp,
         reg_mae_pub=mae_pub,
         reg_mae_no_pub=mae_nop,
@@ -654,7 +677,7 @@ def save_bundle(bundle: ModelBundle) -> None:
         {
             "classifier": bundle.classifier,
             "sale_prob_classifier": bundle.sale_prob_classifier,
-            "numeric_features_pub": bundle.numeric_features_pub,
+            "numeric_features_pub": bundle.numeric_features_classifier_pub,
             "numeric_features_sale_prob": bundle.numeric_features_sale_prob,
             "categorical_features": CATEGORICAL_FEATURES,
             "clf_accuracy": bundle.clf_accuracy,
@@ -753,6 +776,7 @@ def load_bundle(tipo_transaccion: str, segmento: str) -> dict:
         "known_categories":           enc_b.get("known_categories", {}),
         "numeric_features_pub":       reg_pub_b["numeric_features"],
         "numeric_features_no_pub":    reg_nop_b["numeric_features"],
+        "numeric_features_classifier_pub": clf_b.get("numeric_features_pub", reg_pub_b["numeric_features"]),
         "numeric_features_sale_prob": clf_b.get("numeric_features_sale_prob", NUMERIC_FEATURES_SALE_PROB),
         "categorical_features":       categorical_features,
         "reg_mae_pub":                reg_pub_b["reg_mae"],
