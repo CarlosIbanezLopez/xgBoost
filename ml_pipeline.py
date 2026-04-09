@@ -73,11 +73,6 @@ NUMERIC_FEATURES_ALQUILER: List[str] = [
     "precio_publicacion",
     "precio_m2",
     "tiempo_en_mercado",
-    "numero_reducciones",
-    "diferencia_vs_promedio_zona",
-    "ratio_activas_vendidas_zona",
-    "mes_publicacion",
-    "anio_publicacion",
 ]
 
 NUMERIC_FEATURES_ALQUILER_PUB_REG: List[str] = [
@@ -103,7 +98,6 @@ NUMERIC_FEATURES_ALQUILER_NO_PUB: List[str] = [
     "estacionamientos",
     "antiguedad",
     "precio_m2",
-    "ratio_activas_vendidas_zona",
 ]
 
 # Categóricas escalables — el encoder aprende los valores de los datos
@@ -117,7 +111,8 @@ CATEGORICAL_FEATURES: List[str] = [
 ]
 
 # Features para el modelo de velocidad de venta
-# (tiempo_en_mercado se excluye aquí porque es el target de ese modelo)
+# (tiempo_en_mercado se excluye aquí porque es el target de ese modelo;
+#  usarlo como feature introduciría fuga de información)
 NUMERIC_FEATURES_SALE_PROB: List[str] = [
     "latitude",
     "longitude",
@@ -129,11 +124,6 @@ NUMERIC_FEATURES_SALE_PROB: List[str] = [
     "antiguedad",
     "precio_publicacion",
     "precio_m2",
-    "numero_reducciones",
-    "diferencia_vs_promedio_zona",
-    "ratio_activas_vendidas_zona",
-    "mes_publicacion",
-    "anio_publicacion",
 ]
 
 TERRAIN_NUMERIC_FEATURES_PUB: List[str] = [
