@@ -315,6 +315,129 @@ def _log_input(data: dict, tag: str) -> None:
     print(f"[xgboost][{tag}] {j}", flush=True)
 
 
+def _predict_regression_core(
+    payload: PredictRequest,
+    data: dict,
+    *,
+    log_input: bool = True,
+) -> dict:
+    terrain_bundle = None
+    if _is_terrain_request(data.get("tipo_propiedad")):
+        try:
+            terrain_bundle = _get_terrain_bundle(payload.tipo_transaccion)
+        except FileNotFoundError:
+            terrain_bundle = None
+
+    if terrain_bundle is not None:
+        use_no_pub = not _has_terrain_pub_price(data)
+        if log_input:
+            _log_input(data, "regression-terreno")
+
+        numeric_features = (
+            terrain_bundle["numeric_features_no_pub"] if use_no_pub
+            else terrain_bundle["numeric_features_pub"]
+        )
+        X_row = _build_X(
+            data,
+            numeric_features,
+            terrain_bundle["encoder"],
+            terrain_bundle.get("categorical_features"),
+        )
+
+        regressor = (
+            terrain_bundle["regressor_no_pub"] if use_no_pub
+            else terrain_bundle["regressor_pub"]
+        )
+        pred = _inverse_target_transform(
+            float(regressor.predict(X_row)[0]),
+            terrain_bundle.get("target_transform"),
+        )
+
+        reg_mae = (
+            terrain_bundle["reg_mae_no_pub"] if use_no_pub
+            else terrain_bundle["reg_mae_pub"]
+        )
+        price_bins = (
+            terrain_bundle["price_bins_no_pub"] if use_no_pub
+            else terrain_bundle["price_bins_pub"]
+        )
+        pct_errors = (
+            terrain_bundle["mean_abs_pct_error_no_pub"] if use_no_pub
+            else terrain_bundle["mean_abs_pct_error_pub"]
+        )
+        expected_pct = _expected_pct_error(pred, price_bins, pct_errors)
+        model_tag = (
+            f"terrain_{payload.tipo_transaccion}_no_pub"
+            if use_no_pub
+            else f"terrain_{payload.tipo_transaccion}_pub"
+        )
+
+        return {
+            "predicted_price": pred,
+            "expected_abs_error": float(reg_mae),
+            "expected_pct_error": expected_pct,
+            "interval_approx": {
+                "lower": max(pred * (1.0 - expected_pct), 0.0),
+                "upper": pred * (1.0 + expected_pct),
+            },
+            "model_used": model_tag,
+            "is_terrain": True,
+            "data": data,
+        }
+
+    try:
+        idx_pub, idx_no_pub = get_model_indices(payload.tipo_transaccion, payload.segmento)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    bundle = _get_bundle(payload.tipo_transaccion, payload.segmento)
+    use_no_pub = not _has_pub_price(payload)
+
+    data = _apply_market_fallbacks(data, use_no_pub=use_no_pub)
+    if log_input:
+        _log_input(data, "regression")
+
+    numeric_features = (
+        bundle["numeric_features_no_pub"] if use_no_pub
+        else bundle["numeric_features_pub"]
+    )
+    X_row = _build_X(
+        data,
+        numeric_features,
+        bundle["encoder"],
+        bundle.get("categorical_features"),
+    )
+
+    regressor = bundle["regressor_no_pub"] if use_no_pub else bundle["regressor_pub"]
+    pred = float(regressor.predict(X_row)[0])
+
+    reg_mae = bundle["reg_mae_no_pub"] if use_no_pub else bundle["reg_mae_pub"]
+    price_bins = bundle["price_bins_no_pub"] if use_no_pub else bundle["price_bins_pub"]
+    pct_errors = (
+        bundle["mean_abs_pct_error_no_pub"] if use_no_pub
+        else bundle["mean_abs_pct_error_pub"]
+    )
+    expected_pct = _expected_pct_error(pred, price_bins, pct_errors)
+    model_tag = (
+        f"m{idx_no_pub}_{payload.tipo_transaccion}_{payload.segmento}_no_pub"
+        if use_no_pub
+        else f"m{idx_pub}_{payload.tipo_transaccion}_{payload.segmento}_pub"
+    )
+
+    return {
+        "predicted_price": pred,
+        "expected_abs_error": float(reg_mae),
+        "expected_pct_error": expected_pct,
+        "interval_approx": {
+            "lower": max(pred * (1.0 - expected_pct), 0.0),
+            "upper": pred * (1.0 + expected_pct),
+        },
+        "model_used": model_tag,
+        "is_terrain": False,
+        "data": data,
+    }
+
+
 # ---------------------------------------------------------------------------
 # Endpoints
 # ---------------------------------------------------------------------------
@@ -379,57 +502,10 @@ def predict_regression(payload: PredictRequest):
     Predice el precio de venta o alquiler.
     Usa automáticamente el modelo con/sin precio_publicacion según lo que venga.
     """
-    data = _enrich(payload.dict())
-    terrain_bundle = None
-    if _is_terrain_request(data.get("tipo_propiedad")):
-        try:
-            terrain_bundle = _get_terrain_bundle(payload.tipo_transaccion)
-        except FileNotFoundError:
-            terrain_bundle = None
+    prediction = _predict_regression_core(payload, _enrich(payload.dict()))
+    data = prediction["data"]
 
-    if terrain_bundle is not None:
-        use_no_pub = not _has_terrain_pub_price(data)
-        _log_input(data, "regression-terreno")
-
-        numeric_features = (
-            terrain_bundle["numeric_features_no_pub"] if use_no_pub
-            else terrain_bundle["numeric_features_pub"]
-        )
-        X_row = _build_X(
-            data,
-            numeric_features,
-            terrain_bundle["encoder"],
-            terrain_bundle.get("categorical_features"),
-        )
-
-        regressor = (
-            terrain_bundle["regressor_no_pub"] if use_no_pub
-            else terrain_bundle["regressor_pub"]
-        )
-        pred = _inverse_target_transform(
-            float(regressor.predict(X_row)[0]),
-            terrain_bundle.get("target_transform"),
-        )
-
-        reg_mae = (
-            terrain_bundle["reg_mae_no_pub"] if use_no_pub
-            else terrain_bundle["reg_mae_pub"]
-        )
-        price_bins = (
-            terrain_bundle["price_bins_no_pub"] if use_no_pub
-            else terrain_bundle["price_bins_pub"]
-        )
-        pct_errors = (
-            terrain_bundle["mean_abs_pct_error_no_pub"] if use_no_pub
-            else terrain_bundle["mean_abs_pct_error_pub"]
-        )
-        expected_pct = _expected_pct_error(pred, price_bins, pct_errors)
-        model_tag = (
-            f"terrain_{payload.tipo_transaccion}_no_pub"
-            if use_no_pub
-            else f"terrain_{payload.tipo_transaccion}_pub"
-        )
-
+    if prediction["is_terrain"]:
         comparables = fetch_comparable_listings(
             latitude=payload.latitude,
             longitude=payload.longitude,
@@ -445,79 +521,29 @@ def predict_regression(payload: PredictRequest):
             precio_m2_referencia=0.0,
             limit=20,
         )
-
-        return RegressionPrediction(
-            predicted_price=pred,
-            expected_abs_error=float(reg_mae),
-            expected_pct_error=expected_pct,
-            interval_approx={
-                "lower": max(pred * (1.0 - expected_pct), 0.0),
-                "upper": pred * (1.0 + expected_pct),
-            },
-            model_used=model_tag,
-            comparables=comparables,
+    else:
+        comparables = fetch_comparable_listings(
+            latitude=payload.latitude,
+            longitude=payload.longitude,
+            ciudad=data.get("ciudad"),
+            pais=data.get("pais"),
+            tipo_propiedad=data.get("tipo_propiedad"),
+            segmento=payload.segmento,
+            tipo_transaccion=payload.tipo_transaccion,
+            m2_construidos=payload.m2_construidos,
+            m2_terreno=payload.m2_terreno,
+            dormitorios=int(data.get("dormitorios") or 0),
+            banos=int(data.get("banos") or 0),
+            precio_m2_referencia=float(data.get("precio_m2") or 0.0),
+            limit=20,
         )
 
-    try:
-        idx_pub, idx_no_pub = get_model_indices(payload.tipo_transaccion, payload.segmento)
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
-
-    bundle = _get_bundle(payload.tipo_transaccion, payload.segmento)
-    use_no_pub = not _has_pub_price(payload)
-
-    data = _apply_market_fallbacks(data, use_no_pub=use_no_pub)
-    _log_input(data, "regression")
-
-    numeric_features = (
-        bundle["numeric_features_no_pub"] if use_no_pub
-        else bundle["numeric_features_pub"]
-    )
-    X_row = _build_X(
-        data,
-        numeric_features,
-        bundle["encoder"],
-        bundle.get("categorical_features"),
-    )
-
-    regressor = bundle["regressor_no_pub"] if use_no_pub else bundle["regressor_pub"]
-    pred = float(regressor.predict(X_row)[0])
-
-    reg_mae = bundle["reg_mae_no_pub"] if use_no_pub else bundle["reg_mae_pub"]
-    price_bins = bundle["price_bins_no_pub"] if use_no_pub else bundle["price_bins_pub"]
-    pct_errors = bundle["mean_abs_pct_error_no_pub"] if use_no_pub else bundle["mean_abs_pct_error_pub"]
-    expected_pct = _expected_pct_error(pred, price_bins, pct_errors)
-    model_tag = (
-        f"m{idx_no_pub}_{payload.tipo_transaccion}_{payload.segmento}_no_pub"
-        if use_no_pub
-        else f"m{idx_pub}_{payload.tipo_transaccion}_{payload.segmento}_pub"
-    )
-
-    comparables = fetch_comparable_listings(
-        latitude=payload.latitude,
-        longitude=payload.longitude,
-        ciudad=data.get("ciudad"),
-        pais=data.get("pais"),
-        tipo_propiedad=data.get("tipo_propiedad"),
-        segmento=payload.segmento,
-        tipo_transaccion=payload.tipo_transaccion,
-        m2_construidos=payload.m2_construidos,
-        m2_terreno=payload.m2_terreno,
-        dormitorios=int(data.get("dormitorios") or 0),
-        banos=int(data.get("banos") or 0),
-        precio_m2_referencia=float(data.get("precio_m2") or 0.0),
-        limit=20,
-    )
-
     return RegressionPrediction(
-        predicted_price=pred,
-        expected_abs_error=float(reg_mae),
-        expected_pct_error=expected_pct,
-        interval_approx={
-            "lower": max(pred * (1.0 - expected_pct), 0.0),
-            "upper": pred * (1.0 + expected_pct),
-        },
-        model_used=model_tag,
+        predicted_price=prediction["predicted_price"],
+        expected_abs_error=prediction["expected_abs_error"],
+        expected_pct_error=prediction["expected_pct_error"],
+        interval_approx=prediction["interval_approx"],
+        model_used=prediction["model_used"],
         comparables=comparables,
     )
 
@@ -560,6 +586,8 @@ def predict_sale_probability(payload: PredictRequest):
     ≤ 30, ≤ 60, ≤ 90 días o más de 90 días.
 
     Basado en un XGBClassifier entrenado sobre el tiempo_en_mercado histórico.
+    Si no llega precio_publicacion, primero estima un precio sugerido con
+    el modelo de regresión y usa ese valor como señal de entrada.
     Las probabilidades son acumuladas:
       - prob_30_days  = P(venta en ≤ 30 días)
       - prob_60_days  = P(venta en ≤ 60 días)  = P(≤30) + P(31–60)
@@ -573,6 +601,20 @@ def predict_sale_probability(payload: PredictRequest):
 
     bundle = _get_bundle(payload.tipo_transaccion, payload.segmento)
     data   = _enrich(payload.dict())
+
+    if float(data.get("precio_publicacion") or 0) <= 0:
+        regression_prediction = _predict_regression_core(
+            payload,
+            data.copy(),
+            log_input=False,
+        )
+        data["precio_publicacion"] = regression_prediction["predicted_price"]
+        logger.info(
+            "[sale-probability] using regression suggested price %.2f from %s",
+            data["precio_publicacion"],
+            regression_prediction["model_used"],
+        )
+
     _log_input(data, "sale-probability")
 
     # Features del modelo de velocidad (sin tiempo_en_mercado)
