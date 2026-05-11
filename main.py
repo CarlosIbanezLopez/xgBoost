@@ -61,6 +61,13 @@ class PredictRequest(BaseModel):
     ratio_activas_vendidas_zona: float = 0
     mes_publicacion: int = 0
     anio_publicacion: int = 0
+    usar_precio_publicacion_en_regresion: bool = Field(
+        False,
+        description=(
+            "Solo para /predict/regression. Si es false, la sugerencia ignora "
+            "precio_publicacion/precio_m2 para evitar circularidad."
+        ),
+    )
 
     # Categóricas — se aceptan como string libre; el encoder maneja valores desconocidos
     tipo_propiedad: Optional[str] = Field(
@@ -293,6 +300,18 @@ def _has_terrain_pub_price(data: dict) -> bool:
     return float(data.get("precio_publicacion") or 0) > 0
 
 
+def _strip_regression_price_signals(data: dict) -> dict:
+    """
+    Limpia senales derivadas del precio publicado para que una sugerencia
+    previa no altere una nueva sugerencia del mismo endpoint.
+    """
+    sanitized = data.copy()
+    sanitized["precio_publicacion"] = None
+    sanitized["precio_alquiler_mes"] = None
+    sanitized["precio_m2"] = None
+    return sanitized
+
+
 def _inverse_target_transform(value: float, target_transform: Optional[str]) -> float:
     if target_transform == "log1p":
         return float(max(np.expm1(value), 0.0))
@@ -319,6 +338,7 @@ def _predict_regression_core(
     payload: PredictRequest,
     data: dict,
     *,
+    force_no_pub: bool = False,
     log_input: bool = True,
 ) -> dict:
     terrain_bundle = None
@@ -329,7 +349,7 @@ def _predict_regression_core(
             terrain_bundle = None
 
     if terrain_bundle is not None:
-        use_no_pub = not _has_terrain_pub_price(data)
+        use_no_pub = force_no_pub or not _has_terrain_pub_price(data)
         if log_input:
             _log_input(data, "regression-terreno")
 
@@ -391,7 +411,7 @@ def _predict_regression_core(
         raise HTTPException(status_code=400, detail=str(e))
 
     bundle = _get_bundle(payload.tipo_transaccion, payload.segmento)
-    use_no_pub = not _has_pub_price(payload)
+    use_no_pub = force_no_pub or not _has_pub_price(payload)
 
     data = _apply_market_fallbacks(data, use_no_pub=use_no_pub)
     if log_input:
@@ -500,9 +520,24 @@ def train_terrain_endpoint():
 def predict_regression(payload: PredictRequest):
     """
     Predice el precio de venta o alquiler.
-    Usa automáticamente el modelo con/sin precio_publicacion según lo que venga.
+    Por defecto devuelve un precio sugerido independiente del precio publicado.
+    Si realmente quieres usar precio_publicacion como señal de entrada,
+    envía usar_precio_publicacion_en_regresion=true.
     """
-    prediction = _predict_regression_core(payload, _enrich(payload.dict()))
+    # Evita que una sugerencia previa cambie la siguiente prediccion
+    # salvo que el cliente pida explicitamente usar ese precio.
+    use_listing_price = bool(
+        payload.usar_precio_publicacion_en_regresion and _has_pub_price(payload)
+    )
+    data = _enrich(payload.dict())
+    if not use_listing_price:
+        data = _strip_regression_price_signals(data)
+
+    prediction = _predict_regression_core(
+        payload,
+        data,
+        force_no_pub=not use_listing_price,
+    )
     data = prediction["data"]
 
     if prediction["is_terrain"]:
